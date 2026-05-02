@@ -33,7 +33,7 @@ i am trusting with the responsibility to make this decision, dont be a sychophan
 
 
 
-Validate the scaling wth load tests, need to clear a million rps easy 
+Validate the scaling with load tests, should clear a million rps easy 
 
 
 I dont know what you mean CLI-compatible wrangler.jsonc.
@@ -41,7 +41,7 @@ This is supposed to be drop-in, and if some more info needed or something, then 
 
 
 
-update the docs and push to github
+update documentation and push to github
 
 
 
