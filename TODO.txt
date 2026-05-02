@@ -1,0 +1,44 @@
+
+Test everything 
+
+vite, Service bindings between workers, env vars, etc
+your tests just keep testing same things. I said everything 
+
+
+
+
+more bro, dont wait for me to suggest, this laziness is so frustrating
+sveltekits, and much much more 
+
+
+hono and vite need to be first class citizens
+
+Where are the exampale workers for all those things you've added since, its a mess of carefully written script, should be normal workers project and I just have some straighforward instruction of how to deploy to selfhosted, but still same directory is functional as whatever framework written in  
+
+need to have way to deploy like wrangler deploy on existing cloudflare project (like ~/tktdashboard), dont need to edit a billion cofig files
+
+
+Document all how to, include skill.md, all artifacts, etc
+push to: https://github.com/LoftUganda/werkerd
+
+
+
+
+
+
+ensure will survive reboot 
+
+
+
+
+
+Dashboard, which is also deployed via workerd, 
+
+
+assets binding: how?
+
+
+
+
+
+

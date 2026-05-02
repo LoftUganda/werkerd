@@ -1,0 +1,93 @@
+#!/bin/bash
+# /usr/local/bin/workerd-scale
+# Usage:
+#   workerd-scale up   <worker> <port>   — add an instance
+#   workerd-scale down <worker> <port>   — remove an instance
+#   workerd-scale list <worker>          — show running instances
+
+set -euo pipefail
+
+ACTION=$1
+WORKER=$2
+PORT=${3:-}
+PORTS_FILE="/etc/workerd/workers/$WORKER/ports"
+SOCKET_UNIT="workerd-${WORKER}-${PORT}.socket"
+SERVICE_UNIT="workerd@${WORKER}:${PORT}.service"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+case $ACTION in
+  up)
+    [ -z "$PORT" ] && die "port required"
+
+    # Check port is not already in use by another worker
+    if ss -tlnp | grep -q ":${PORT}\b"; then
+        die "Port $PORT is already in use"
+    fi
+
+    # Ensure worker directory exists
+    mkdir -p "/etc/workerd/workers/$WORKER"
+
+    # Add to ports file if not already there
+    grep -qxF "$PORT" "$PORTS_FILE" 2>/dev/null || echo "$PORT" >> "$PORTS_FILE"
+
+    # Generate config for this instance
+    /usr/local/bin/workerd-gen-config "$WORKER" "$PORT"
+
+    # Create socket unit file
+    cat > "/etc/systemd/system/${SOCKET_UNIT}" << SOCKETEOF
+[Unit]
+Description=Socket for workerd ${WORKER}:${PORT}
+
+[Socket]
+ListenStream=0.0.0.0:${PORT}
+NoDelay=true
+Service=${SERVICE_UNIT}
+
+[Install]
+WantedBy=sockets.target
+SOCKETEOF
+
+    systemctl daemon-reload
+    systemctl enable --now "$SOCKET_UNIT"
+
+    # Regenerate Caddyfile
+    /usr/local/bin/workerd-gen-caddyfile
+    caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+
+    echo "✔  ${SERVICE_UNIT} started on port ${PORT}"
+    ;;
+
+  down)
+    [ -z "$PORT" ] && die "port required"
+
+    systemctl stop    "$SERVICE_UNIT" 2>/dev/null || true
+    systemctl disable "$SERVICE_UNIT" 2>/dev/null || true
+    systemctl stop    "$SOCKET_UNIT"  2>/dev/null || true
+    systemctl disable "$SOCKET_UNIT"  2>/dev/null || true
+    rm -f "/etc/systemd/system/${SOCKET_UNIT}"
+    systemctl daemon-reload
+
+    # Remove from ports file
+    sed -i "/^${PORT}$/d" "$PORTS_FILE"
+
+    # Regenerate Caddyfile
+    /usr/local/bin/workerd-gen-caddyfile
+    caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+
+    echo "✔  ${SERVICE_UNIT} stopped"
+    ;;
+
+  list)
+    echo "Active instances for $WORKER:"
+    systemctl list-units "workerd@${WORKER}:*" --no-legend --state=active 2>/dev/null || true
+    echo ""
+    echo "Registered ports:"
+    cat "$PORTS_FILE" 2>/dev/null || echo "  (no ports file)"
+    ;;
+
+  *)
+    echo "Usage: workerd-scale up|down|list <worker> [port]"
+    exit 1
+    ;;
+esac

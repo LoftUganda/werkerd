@@ -1,0 +1,10 @@
+{
+  "name": "api",
+  "entrypoint": "worker.js",
+  "compatibilityDate": "2024-09-23",
+  "group": ["api", "auth"],
+  "bindings": [
+    { "name": "AUTH", "service": "auth" }
+  ],
+  "env": ["SECRET_KEY"]
+}

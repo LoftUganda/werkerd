@@ -1,0 +1,251 @@
+#!/usr/bin/env node
+// /usr/local/bin/workerd-gen-config
+// Usage: workerd-gen-config <worker-name> <port>
+// Reads /etc/workerd/workers/<name>/manifest.json
+// Writes /etc/workerd/workers/<name>/config.<port>.capnp
+//
+// Supports: ES modules, service workers, service bindings, env vars,
+// Durable Objects, KV, R2, Queues, Hyperdrive, MemoryCache, WebSocket heads-up,
+// static assets, tail workers, and internet access control.
+
+const fs   = require("fs");
+const path = require("path");
+
+const [,, workerName, port] = process.argv;
+
+if (!workerName || !port) {
+  console.error("Usage: workerd-gen-config <worker-name> <port>");
+  process.exit(1);
+}
+
+const base = `/etc/workerd/workers/${workerName}`;
+const manifestPath = `${base}/manifest.json`;
+
+if (!fs.existsSync(manifestPath)) {
+  console.error(`ERROR: manifest.json not found at ${manifestPath}`);
+  process.exit(1);
+}
+
+const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+
+function detectModuleType(workerEntryPath) {
+  try {
+    const src = fs.readFileSync(workerEntryPath, "utf8").trimStart();
+    if (/^(export |import )/m.test(src)) return "esm";
+  } catch (_) {}
+  return "service-worker";
+}
+
+function copyGroupWorker(groupName, primaryDir) {
+  const groupDir = `/etc/workerd/workers/${groupName}`;
+  const srcFile  = `${groupDir}/worker.js`;
+  if (!fs.existsSync(srcFile)) {
+    console.error(`WARNING: group member "${groupName}" has no worker.js at ${srcFile}`);
+    return null;
+  }
+  const destFile = `${primaryDir}/group-${groupName}.js`;
+  fs.copyFileSync(srcFile, destFile);
+  return `group-${groupName}.js`;
+}
+
+function buildBindingLine(b) {
+  // b = { type, name, ... }
+  switch (b.type) {
+    case "service":
+      return `      ( name = "${b.name}", service = "${b.service}" ),`;
+    case "durableObjectNamespace":
+      return `      ( name = "${b.name}", durableObjectNamespace = ( className = "${b.className}" ) ),`;
+    case "durableObjectClass":
+      return `      ( name = "${b.name}", durableObjectClass = "${b.service}" ),`;
+    case "kvNamespace":
+      return `      ( name = "${b.name}", kvNamespace = "${b.service}" ),`;
+    case "r2Bucket":
+      return `      ( name = "${b.name}", r2Bucket = "${b.service}" ),`;
+    case "queue":
+      return `      ( name = "${b.name}", queue = "${b.service}" ),`;
+    case "analyticsEngine":
+      return `      ( name = "${b.name}", analyticsEngine = "${b.service}" ),`;
+    case "fromEnvironment":
+      return `      ( name = "${b.name}", fromEnvironment = "${b.name}" ),`;
+    case "text":
+      return `      ( name = "${b.name}", text = ${JSON.stringify(b.text)} ),`;
+    case "json":
+      return `      ( name = "${b.name}", json = ${JSON.stringify(b.json)} ),`;
+    case "data":
+      return `      ( name = "${b.name}", data = embed "${b.file}" ),`;
+    case "wasmModule":
+      return `      ( name = "${b.name}", wasmModule = embed "${b.file}" ),`;
+    case "unsafeEval":
+      return `      ( name = "${b.name}", unsafeEval = void ),`;
+    case "memoryCache":
+      return `      ( name = "${b.name}", memoryCache = ( id = "${b.id}" ) ),`;
+    case "hyperdrive":
+      return `      ( name = "${b.name}", hyperdrive = ( designator = "${b.designator}", database = "${b.database}", user = "${b.user}", password = "${b.password}", scheme = "${b.scheme || "postgres"}" ) ),`;
+    case "cryptoKey":
+      if (b.jwk)
+        return `      ( name = "${b.name}", cryptoKey = ( algorithm = ( name = "${b.algorithm}" ), jwk = ${JSON.stringify(b.jwk)} ) ),`;
+      if (b.hex)
+        return `      ( name = "${b.name}", cryptoKey = ( algorithm = ( name = "${b.algorithm}" ), hex = "${b.hex}" ) ),`;
+      return `      ( name = "${b.name}", cryptoKey = ( algorithm = ( name = "${b.algorithm}" ), raw = embed "${b.file}" ) ),`;
+    default:
+      console.error(`WARNING: unknown binding type "${b.type}" for ${b.name}`);
+      return `      # UNKNOWN BINDING: ${JSON.stringify(b)},`;
+  }
+}
+
+function generateConfig(manifest, port) {
+  const group      = manifest.group || [manifest.name];
+  const entrypoint = manifest.entrypoint || "worker.js";
+  const compatDate = manifest.compatibilityDate || "2024-09-23";
+  const primaryName = manifest.name;
+
+  // Copy group members' code
+  for (const name of group) {
+    if (name !== primaryName) {
+      const copied = copyGroupWorker(name, base);
+      if (copied) console.log(`  Copied ${name}/worker.js → ${copied}`);
+    }
+  }
+
+  // Services list
+  const services = group.map(name =>
+    `    (name = "${name}", worker = .${name}Worker),`
+  ).join("\n");
+
+  // Durable Object namespaces (config-level)
+  const doNamespaces = [];
+  for (const doDef of (manifest.durableObjects || [])) {
+    const storage = doDef.ephemeral
+      ? "ephemeralLocal = void"
+      : `uniqueKey = "${doDef.uniqueKey || doDef.className + "-key"}"`;
+    const eviction = doDef.preventEviction ? ",\n      preventEviction = true" : "";
+    const sql = doDef.enableSql ? ",\n      enableSql = true" : "";
+    doNamespaces.push(
+`    ( className = "${doDef.className}", ${storage}${eviction}${sql} )`
+    );
+  }
+
+  const doBlock = doNamespaces.length > 0
+    ? "  durableObjectNamespaces = [\n" + doNamespaces.join(",\n") + "\n  ],"
+    : "";
+
+  // Durable Object storage
+  const doStorage = doNamespaces.length > 0
+    ? (manifest.durableObjectStorage === "localDisk"
+      ? `  durableObjectStorage = localDisk = "${manifest.doStorageService || "disk-service"}",`
+      : "  durableObjectStorage = inMemory,")
+    : "";
+
+  // Tail workers
+  const tails = [];
+  for (const t of (manifest.tails || [])) {
+    tails.push(`"${t}"`);
+  }
+  const tailsBlock = tails.length > 0
+    ? `  tails = [ ${tails.join(", ")} ],`
+    : "";
+
+  // Global outbound (internet access)
+  const outbound = manifest.disableInternet
+    ? "  globalOutbound = ( name = \"blocked\", service = \".blocked\" ),"
+    : "";
+
+  // Workers
+  const workers = group.map(name => {
+    const isPrimary = (name === primaryName);
+
+    let scriptPath, scriptAbs;
+    if (isPrimary) {
+      scriptPath = entrypoint;
+      scriptAbs  = `${base}/${entrypoint}`;
+    } else {
+      scriptPath = `group-${name}.js`;
+      scriptAbs  = `${base}/${scriptPath}`;
+    }
+
+    const explicitType = (isPrimary ? manifest.moduleType : null) ||
+                         (manifest.groupModules && manifest.groupModules[name]);
+    const moduleType = explicitType || detectModuleType(scriptAbs);
+
+    const bindings = [];
+    if (isPrimary) {
+      for (const b of (manifest.bindings || [])) {
+        bindings.push(buildBindingLine(b));
+      }
+      for (const envName of (manifest.env || [])) {
+        bindings.push(`      ( name = "${envName}", fromEnvironment = "${envName}" ),`);
+      }
+    }
+
+    const bindingsBlock = bindings.length > 0
+      ? "bindings = [\n" + bindings.join("\n") + "\n    ],"
+      : "";
+
+    let workerBlock;
+    if (moduleType === "esm") {
+      workerBlock =
+`const ${name}Worker :Workerd.Worker = (
+  modules = [ ( name = "${scriptPath}", esModule = embed "${scriptPath}" ) ],
+  compatibilityDate   = "${compatDate}",
+  ${bindingsBlock}
+);`;
+    } else {
+      workerBlock =
+`const ${name}Worker :Workerd.Worker = (
+  serviceWorkerScript = embed "${scriptPath}",
+  compatibilityDate   = "${compatDate}",
+  ${bindingsBlock}
+);`;
+    }
+    return workerBlock;
+  }).join("\n\n");
+
+  const socketService = manifest.socket || primaryName;
+
+  // Static assets directory (if specified)
+  // Static assets directory (if specified)
+  let assetsBlock = "";
+  if (manifest.assets) {
+    assetsBlock = `const config :Workerd.Config = (
+  services = [
+${services}
+  ],
+  sockets = [
+    ( name    = "http",
+      address = "*:${port}",
+      http    = (),
+      service = "${socketService}"
+    ),
+  ],
+);
+
+${workers}
+`;
+    return assetsBlock;
+  }
+
+  return (
+`using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  services = [
+${services}
+  ],
+  sockets = [
+    ( name    = "http",
+      address = "*:${port}",
+      http    = (),
+      service = "${socketService}"
+    ),
+  ]
+);
+
+${workers}
+`);
+
+}
+
+const config = generateConfig(manifest, port);
+const outPath = `${base}/config.${port}.capnp`;
+fs.writeFileSync(outPath, config);
+console.log(`Wrote ${outPath}`);

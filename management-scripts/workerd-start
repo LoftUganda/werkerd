@@ -1,0 +1,21 @@
+#!/bin/bash
+# /usr/local/bin/workerd-start
+# Called by workerd@.service with %i as argument (e.g., "api:8080")
+set -euo pipefail
+
+INSTANCE="$1"                            # e.g. "api:8080"
+WORKER="${INSTANCE%%:*}"                 # e.g. "api"
+PORT="${INSTANCE##*:}"                   # e.g. "8080"
+
+CONFIG="/etc/workerd/workers/${WORKER}/config.${PORT}.capnp"
+
+# Generate the config if it doesn't exist (first boot, or after cleanup)
+if [ ! -f "$CONFIG" ]; then
+    /usr/local/bin/workerd-gen-config "$WORKER" "$PORT"
+fi
+
+# Load environment variables if present
+ENVFILE="/etc/workerd/workers/${WORKER}/.env"
+[ -f "$ENVFILE" ] && set -a && source "$ENVFILE" && set +a
+
+exec /usr/bin/workerd serve "$CONFIG" --socket-fd http=3

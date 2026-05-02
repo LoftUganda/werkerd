@@ -1,0 +1,33 @@
+#!/bin/bash
+# /var/git/<worker>.git/hooks/post-receive
+# Receives: <oldrev> <newrev> <refname> on stdin
+# Called by git push to the bare repo
+
+set -euo pipefail
+
+WORKER="PLACEHOLDER"   # replaced when hook is installed
+GIT_DIR="/var/git/${WORKER}.git"
+DEPLOY_DIR="/etc/workerd/workers/${WORKER}"
+PORTS_FILE="${DEPLOY_DIR}/ports"
+
+while read oldrev newrev refname; do
+    [ "$refname" = "refs/heads/main" ] || continue
+
+    echo "→ Checking out worker.js..."
+    git --work-tree="$DEPLOY_DIR" --git-dir="$GIT_DIR" checkout -f main -- worker.js
+
+    echo "→ Regenerating configs..."
+    while IFS= read -r port; do
+        /usr/local/bin/workerd-gen-config "$WORKER" "$port"
+        echo "  config.${port}.capnp written"
+    done < "$PORTS_FILE"
+
+    echo "→ Rolling restart..."
+    while IFS= read -r port; do
+        sudo systemctl restart "workerd@${WORKER}:${port}"
+        echo "  restarted :${port}"
+        sleep 0.5
+    done < "$PORTS_FILE"
+
+    echo "✔  Deployed $WORKER ($(wc -l < "$PORTS_FILE") instances)"
+done

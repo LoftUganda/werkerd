@@ -1,0 +1,9 @@
+{
+  "name": "sveltekit",
+  "entrypoint": "sveltekit-worker.js",
+  "compatibilityDate": "2024-09-23",
+  "moduleType": "esm",
+  "group": ["sveltekit"],
+  "env": [],
+  "bindings": []
+}

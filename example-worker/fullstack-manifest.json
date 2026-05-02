@@ -1,0 +1,39 @@
+{
+  "name": "fullstack",
+  "entrypoint": "fullstack-worker.js",
+  "compatibilityDate": "2024-09-23",
+  "moduleType": "esm",
+  "group": ["fullstack"],
+  "bindings": [
+    {
+      "type": "durableObjectNamespace",
+      "name": "COUNTER",
+      "className": "Counter"
+    },
+    {
+      "type": "durableObjectNamespace",
+      "name": "CHATROOM",
+      "className": "ChatRoom"
+    },
+    {
+      "type": "kvNamespace",
+      "name": "STORE",
+      "service": "kv-service"
+    }
+  ],
+  "env": ["SECRET_KEY"],
+  "durableObjects": [
+    {
+      "className": "Counter",
+      "uniqueKey": "global-counter-key-v1",
+      "preventEviction": true,
+      "enableSql": true
+    },
+    {
+      "className": "ChatRoom",
+      "uniqueKey": "chatroom-key-v1",
+      "preventEviction": false
+    }
+  ],
+  "durableObjectStorage": "inMemory"
+}

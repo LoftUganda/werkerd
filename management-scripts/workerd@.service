@@ -1,0 +1,19 @@
+[Unit]
+Description=workerd %i
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/workerd-start %i
+Restart=always
+RestartSec=1
+User=workerd
+Group=workerd
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/workerd /var/lib/workerd
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=workerd-%i
+
+[Install]
+WantedBy=multi-user.target

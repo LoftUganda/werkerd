@@ -1,0 +1,6 @@
+{
+  "name": "hello",
+  "entrypoint": "worker.js",
+  "compatibilityDate": "2024-09-23",
+  "group": ["hello"]
+}
