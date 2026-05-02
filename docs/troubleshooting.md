@@ -102,6 +102,85 @@ DNS is not configured. Either:
 1. Set up DNS pointing to the server IP
 2. Add the domain to Caddyfile and reload
 
+## Caddy Performance Issues
+
+### Symptom: High latency through Caddy LB
+
+```
+Direct workerd (localhost:8080): 5ms
+Caddy LB (localhost:80): 50ms+        # >10x slower than direct
+```
+
+**Check**: Are connection pooling and keepalive enabled?
+
+```bash
+# Check current Caddy config
+cat /etc/caddy/Caddyfile | grep -A10 "transport http"
+```
+
+**Fix**: Regenerate Caddyfile with connection pooling:
+```bash
+workerd-gen-caddyfile
+caddy reload --config /etc/caddy/Caddyfile
+```
+
+The optimized config adds `transport http` blocks with `keepalive 30s`, `max_conns_per_host 200`, and `keepalive_idle_conns 100`. This eliminates the TCP 3-way handshake per request.
+
+**Expected improvement**: 2,893 → 4,425 RPS (+53%), p99 from 757ms → 114ms (-85%)
+
+### Symptom: Caddy returns 502 under load
+
+```
+Under heavy load: 502 Bad Gateway
+```
+
+**Common causes**:
+
+| Cause | Diagnosis | Fix |
+|---|---|---|
+| Connection exhaustion | `ss -s` shows high established | Increase `max_conns_per_host` |
+| FD limit hit | `ls /proc/$(pgrep caddy)/fd \| wc -l` near limit | `LimitNOFILE=65536` in systemd |
+| Upstream saturated | Workerd CPU at 100% | Scale more instances |
+| Health check timeout | `curl localhost:2019/metrics \| grep healthy` shows 0 | Check `/healthz` on all backends |
+| GC pauses | Memory growth over time | Check Go runtime: `GODEBUG=gctrace=1` |
+
+### Diagnostic Commands
+
+```bash
+# Caddy metrics (requires admin API enabled)
+curl -s http://localhost:2019/metrics | grep -E "reverse_proxy|upstream"
+
+# Active connections breakdown
+ss -s
+
+# File descriptor count
+ls /proc/$(pgrep caddy)/fd | wc -l
+
+# Established TCP connections
+netstat -an | grep ESTABLISHED | wc -l
+
+# Check OS limits
+cat /proc/$(pgrep caddy)/limits | grep "open files"
+
+# Per-port throughput (while under load)
+for port in 8080 8081; do
+  echo -n ":$port → $(curl -s -o /dev/null -w '%{time_total}s' localhost:$port/)$port "
+done
+```
+
+### Benchmarking
+
+```bash
+# Baseline: direct workerd
+wrk -t2 -c100 -d15s --latency http://localhost:8080/
+
+# Through Caddy LB
+wrk -t2 -c200 -d15s --latency http://localhost:80/
+
+# External (real-world)
+wrk -t4 -c100 -d15s --latency http://<public-ip>:8080/
+```
+
 ## Git Push Failing
 
 ### Symptom: Permission denied (publickey)

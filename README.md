@@ -18,8 +18,9 @@ A self-hosted Cloudflare Workers runtime built on [workerd](https://github.com/c
 - **Environment variables** — `.env` file + text bindings for config
 - **Zero-downtime deploys** — rolling restart across instances
 - **Socket activation** — systemd lazily spawns workers on first request
-- **Load balancing** — Caddy reverse proxy with `/healthz` checks
-- **Scaling** — per-worker instance scaling across multiple ports
+- **Load balancing** — Caddy reverse proxy with `/healthz` checks and connection pooling
+- **Scaling** — per-worker instance scaling across multiple ports; ~4,550 RPS/core
+- **Observability** — Caddy admin API on `:2019/metrics` for monitoring
 
 ## Quickstart
 
@@ -51,6 +52,26 @@ All examples are standard npm projects. Each has `wrangler.jsonc` + `package.jso
 | **API + Auth** | `example-worker/` | `workerd-scale up api 8090` | Service bindings, env vars, multi-worker |
 
 All examples are deployed and live on the server.
+
+## Performance
+
+| Configuration | RPS | p50 Latency | p99 Latency |
+|---|---|---|---|
+| Direct workerd (1 instance, localhost) | **8,873** | 5.5ms | — |
+| Caddy LB :80 → 5 instances | **4,425** | 43ms | 114ms |
+| Caddy LB (unoptimized baseline) | 2,893 | 52ms | 757ms |
+| Hono app (1 instance, localhost) | **926** | 65ms | 476ms |
+| Fullstack (DO counter) | **3,508** | 1.5ms | 269ms |
+| External (London ← US) | ~340 | 250ms | 878ms |
+
+**Scaling**: Each workerd instance delivers ~4,550 RPS per core. Instances scale linearly — 2 instances = 2x throughput. Caddy LB adds ~2x overhead (expected for any L7 proxy). To reach 1M RPS: ~220 cores with direct workerd, ~440 cores behind Caddy.
+
+**Caddy optimizations applied** (connection pooling and keepalive from `workerd-gen-caddyfile`):
+- `max_conns_per_host200` — prevents upstream connection exhaustion
+- `keepalive30s` — reuses TCP connections (biggest win — eliminates per-request handshake)
+- `keepalive_idle_conns100` — pool of warm connections ready for reuse
+- `log level WARN` — reduces I/O pressure from access logging
+- Admin API on `:2019` for `curl localhost:2019/metrics` monitoring
 
 ## Live Endpoints
 

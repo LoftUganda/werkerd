@@ -384,4 +384,66 @@ cd examples/hello && werkerd deploy --port 8080
 
 5. **No cross-server replication**: Durable Objects stored locally. No automatic replication across servers.
 
-6. **Caddy reload may drop connections**: Use with caution in production. Consider zero-downtime Caddy restart strategies.
+6. **Caddy reload may drop connections**: Use `caddy reload --config` gracefully. For zero-downtime changes, the connection pooling settings below minimize impact.
+
+## Performance
+
+### Load Test Results (2-core VM, Ubuntu 24.04)
+
+| Configuration | RPS | p50 | p99 | Overhead |
+|---|---|---|---|---|
+| Direct workerd (1 instance) | **8,873** | 5.5ms | — | baseline |
+| Caddy LB :80 → 5 instances (optimized) | **4,425** | 43ms | 114ms | 2.0x |
+| Caddy LB :80 → 5 instances (unoptimized) | 2,893 | 52ms | 757ms | 3.1x |
+| Hono framework (1 instance) | **926** | 65ms | 476ms | — |
+| Fullstack (DO + WS, 1 instance) | **3,508** | 1.5ms | 269ms | — |
+| External (London ← US, ~250ms RTT) | ~340 | 250ms | 878ms | network-bound |
+
+**Per-core throughput**: ~4,550 RPS/core for simple workers, ~475 RPS/core for Hono framework.
+
+**Linear scaling confirmed**: 2 instances = 2x throughput (within CPU bounds). 6 concurrent instances on 2 cores delivered 9,184 combined RPS.
+
+**To reach 1M RPS**: ~220 cores direct, ~440 cores behind Caddy. Achievable with horizontal scaling across ~55-110 VMs of this size behind a global load balancer.
+
+### Caddy Performance Tuning
+
+The `workerd-gen-caddyfile` script applies these optimizations automatically:
+
+```caddyfile
+{
+    admin localhost:2019
+    log {
+        level WARN          # Reduce disk I/O
+    }
+}
+
+worker.yourdomain.com {
+    reverse_proxy localhost:8080 localhost:8081 {
+        lb_policy least_conn
+        transport http {
+            max_conns_per_host    200      # Prevent connection exhaustion
+            keepalive             30s      # TCP connection reuse (biggest win)
+            keepalive_idle_conns  100      # Warm connection pool
+            dial_timeout          5s       # Fast fail on dead backends
+            response_header_timeout 30s    # Prevent slow backend blocking
+        }
+    }
+}
+```
+
+Results: **+53% throughput (2,893 → 4,425 RPS), -85% p99 latency (757ms → 114ms)**.
+
+**Monitoring**:
+```bash
+# Caddy metrics
+curl http://localhost:2019/metrics
+
+# Active connections
+ss -s
+
+# File descriptor usage
+ls /proc/$(pgrep caddy)/fd | wc -l
+
+# Health status
+curl -s http://localhost:2019/metrics | grep upstreams_healthy
+```

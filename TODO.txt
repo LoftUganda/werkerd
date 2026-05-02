@@ -45,6 +45,8 @@ update documentation and push to github
 
 
 
+load balancer is supposed to improve throughput, you can;t tell me you're just settling for LB which does more harm than good, maybe because your scaling is creatin g new process instead of new isolate, dont dwell on this, just find the problem
+
 ensure will survive reboot 
 
 

@@ -22,3 +22,5 @@ build/
 *.pem
 *.key
 *.crt
+
+workerd-platform-handoff.md
