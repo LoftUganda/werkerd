@@ -1,0 +1,9 @@
+{
+  "name": "hello",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "werkerd deploy"
+  },
+  "dependencies": {}
+}

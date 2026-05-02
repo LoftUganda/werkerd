@@ -1,0 +1,15 @@
+{
+  "name": "werkerd",
+  "version": "1.0.0",
+  "description": "Deploy any Cloudflare Workers project to your own self-hosted workerd infrastructure",
+  "type": "module",
+  "bin": {
+    "werkerd": "./bin/werkerd.js"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "keywords": ["workerd", "cloudflare", "workers", "self-hosted", "deploy", "hono", "vite"],
+  "license": "MIT"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "hono-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "werkerd deploy --port 8082",
+    "dev": "werkerd dev"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  }
+}

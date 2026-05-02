@@ -2,16 +2,33 @@
 
 ## Overview
 
-`werkerd` is a skill for deploying and managing self-hosted Cloudflare Workers runtimes using the open-source `workerd` binary. It provides zero-downtime deployments, socket activation, Caddy reverse proxying, and a git-push deploy pipeline — all running on your own Ubuntu infrastructure without any Cloudflare account.
+`werkerd` is a self-hosted Cloudflare Workers runtime using the open-source `workerd` binary. It provides a CLI (`werkerd deploy`) that works like `wrangler deploy` — run it in any Cloudflare Workers project directory and it deploys to your own server. No Cloudflare account needed.
+
+**Server**: `root@18.171.244.124` (Ubuntu 24.04)
+
+## Quickstart
+
+```bash
+# 1. Install the CLI
+cd werkerd-cli && npm install && npm link
+
+# 2. Deploy any Cloudflare Workers project
+cd ~/my-worker-project
+werkerd deploy --port 8080
+
+# That's it. Zero config editing.
+```
+
+The CLI reads `wrangler.jsonc` (or `wrangler.toml`) from your project, bundles with esbuild if needed, generates the Cap'n Proto config, uploads everything, and starts a systemd socket-activated service on the target port.
 
 ## When to Use This Skill
 
 Load this skill when:
-- Deploying a worker to a self-hosted workerd server (`ubuntu@18.171.244.124`)
-- Setting up a new worker with service bindings, Durable Objects, KV, or WebSockets
-- Scaling a worker up/down across multiple ports
+- Deploying a worker to `root@18.171.244.124`
+- Setting up service bindings, Durable Objects, KV, or WebSockets
+- Scaling a worker up/down across ports
 - Troubleshooting systemd, Caddy, or workerd config issues
-- Adding secrets or environment variables to workers
+- Adding environment variables or secrets to workers
 - Setting up a new server from scratch
 
 ## Architecture
@@ -20,229 +37,162 @@ Load this skill when:
 ┌──────────────────────────────────────────────────┐
 │                  Internet                         │
 └─────────────────┬────────────────────────────────┘
-                  │ :80, :443
+                  │ :80
                   ▼
 ┌──────────────────────────────────────────────────┐
-│  Caddy (reverse proxy + auto TLS)                │
-│  /etc/caddy/Caddyfile                            │
-└─────────────┬────────────┬───────────────────────┘
+│  Caddy (reverse proxy)                            │
+│  /etc/caddy/Caddyfile                             │
+└─────────────┬────────────┬────────────────────────┘
               │            │
      localhost:8080  localhost:8081  (up to N ports)
               │            │
               ▼            ▼
 ┌──────────────────────────────────────────────────┐
 │  systemd socket activation                       │
-│  workerd-hello-8080.socket → workerd@hello:8080  │
-│  workerd-hello-8081.socket → workerd@hello:8081  │
+│  workerd-<name>-<port>.socket → workerd@<name>:<port>
 └──────────────────────────────────────────────────┘
               │
               ▼
 ┌──────────────────────────────────────────────────┐
-│  workerd process (per instance)                  │
-│  /usr/bin/workerd serve config.{port}.capnp      │
-│  --socket-fd http=3                              │
+│  workerd process (per instance)                   │
+│  /usr/bin/workerd serve config.<port>.capnp       │
+│  --socket-fd http=3                               │
 └──────────────────────────────────────────────────┘
               │
               ▼
 ┌──────────────────────────────────────────────────┐
-│  /etc/workerd/workers/<name>/                    │
-│    worker.js          ← git push deploy          │
-│    manifest.json       ← worker config           │
-│    config.{port}.capnp ← generated per port      │
-│    .env                ← environment variables   │
-│    ports               ← active port list        │
+│  /etc/workerd/workers/<name>/                     │
+│    index.js              ← uploaded by CLI        │
+│    config.<port>.capnp   ← generated per port     │
+│    .env                  ← environment variables  │
+│    ports                 ← active port list        │
 └──────────────────────────────────────────────────┘
 ```
 
-## Prerequisites
+## Project Format
 
-| Component | Minimum Version | Purpose |
-|-----------|----------------|---------|
-| Ubuntu | 20.04+ | Server OS |
-| Node.js | 18.x+ | Config generator runtime |
-| workerd | latest npm | Workers runtime |
-| Caddy | 2.x | Reverse proxy + TLS |
-| systemd | 245+ | Socket activation |
+Any project with `wrangler.jsonc` works. Standard Cloudflare Workers project structure:
 
-## Management Scripts
+```
+my-project/
+├── wrangler.jsonc       ← read by werkerd deploy
+├── package.json
+├── src/
+│   └── index.js         ← entrypoint
+└── .env                 ← optional, copied to server for secrets
+```
 
-All scripts are installed at `/usr/local/bin/`:
+### wrangler.jsonc
 
-| Script | Purpose | Usage |
-|--------|---------|-------|
-| `workerd-gen-config` | Generate Cap'n Proto config from manifest | `workerd-gen-config <name> <port>` |
-| `workerd-start` | systemd ExecStart wrapper | Called by systemd only |
-| `workerd-scale` | Scale worker across ports | `workerd-scale up\|down\|list <name> [port]` |
-| `workerd-gen-caddyfile` | Generate Caddy upstream config | `workerd-gen-caddyfile` |
-| `workerd-deploy` | Manual deploy (alternative to git push) | `workerd-deploy <name>` |
+The CLI reads standard Cloudflare `wrangler.jsonc` fields:
 
-### Configuration Generation
-
-The `workerd-gen-config` script reads a worker's `manifest.json` and produces a Cap'n Proto config file. The config generator auto-detects module type (ES module vs service worker) and supports all binding types.
-
-### Scaling
-
-The `workerd-scale` script manages per-port socket units:
-- `workerd-scale up <worker> <port>` — Generates config, creates socket unit, starts systemd service
-- `workerd-scale down <worker> <port>` — Stops service, removes socket unit, cleans up
-- `workerd-scale list <worker>` — Shows active instances and registered ports
-
-Port conflict detection prevents duplicates across workers.
-
-## Worker Manifest Format
-
-Each worker has a `manifest.json` at `/etc/workerd/workers/<name>/manifest.json`:
-
-```json
+```jsonc
 {
   "name": "my-worker",
-  "entrypoint": "worker.js",
-  "compatibilityDate": "2024-09-23",
-  "moduleType": "esm",
-  "group": ["my-worker"],
-  "bindings": [
-    { "type": "service",           "name": "AUTH",    "service": "auth-svc" },
-    { "type": "durableObjectNamespace", "name": "COUNTER", "className": "Counter" },
-    { "type": "kvNamespace",       "name": "STORE",   "service": "kv-service" },
-    { "type": "r2Bucket",          "name": "BUCKET",  "service": "r2-service" },
-    { "type": "queue",             "name": "TASKS",   "service": "queue-service" },
-    { "type": "fromEnvironment",   "name": "SECRET_KEY" },
-    { "type": "text",              "name": "CONFIG",  "text": "some static text" },
-    { "type": "json",              "name": "SETTINGS","json": "{}" },
-    { "type": "memoryCache",       "name": "CACHE",   "id": "my-cache" },
-    { "type": "unsafeEval",        "name": "EVAL" },
-    { "type": "hyperdrive",        "name": "DB",
-      "designator": "my-db", "database": "mydb", "user": "admin",
-      "password": "pass", "scheme": "postgres" },
-    { "type": "cryptoKey",         "name": "SIGNING_KEY",
-      "algorithm": "Ed25519", "hex": "abcdef..." },
-    { "type": "analyticsEngine",   "name": "ANALYTICS", "service": "ae-service" }
+  "main": "src/index.js",
+  "compatibility_date": "2024-09-23",
+
+  // Text bindings (available as env.VAR_NAME)
+  "vars": {
+    "GREETING": "Hello!",
+    "APP_ENV": "production"
+  },
+
+  // KV namespaces
+  "kv_namespaces": [
+    { "binding": "STORE", "id": "my-store" }
   ],
-  "env": ["SECRET_KEY", "OTHER_VAR"],
-  "durableObjects": [
-    {
-      "className": "Counter",
-      "uniqueKey": "global-counter-key-v1",
-      "preventEviction": true,
-      "enableSql": true
-    }
+
+  // R2 buckets
+  "r2_buckets": [
+    { "binding": "ASSETS", "bucket_name": "my-bucket" }
   ],
-  "durableObjectStorage": "inMemory",
-  "tailWorkers": ["tail-svc"],
-  "disableInternet": false
+
+  // D1 databases
+  "d1_databases": [
+    { "binding": "DB", "database_id": "my-db" }
+  ],
+
+  // Durable Objects
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" },
+      { "name": "ROOM",    "class_name": "ChatRoom" }
+    ]
+  },
+
+  // Service bindings (call other workers)
+  "services": [
+    { "binding": "AUTH", "service": "auth-worker" }
+  ],
+
+  // Queues
+  "queues": {
+    "producers": [
+      { "binding": "TASKS", "queue": "task-queue" }
+    ]
+  }
 }
 ```
 
-### Binding Types Reference
+## CLI Commands
 
-| Type | Config Field | Required Props | Purpose |
-|------|-------------|---------------|---------|
-| `service` | Service binding | `name`, `service` | Call another worker via `env.NAME.fetch()` |
-| `durableObjectNamespace` | DO namespace | `name`, `className` | Access Durable Objects via `env.NAME` |
-| `kvNamespace` | KV namespace | `name`, `service` | KV storage binding |
-| `r2Bucket` | R2 bucket | `name`, `service` | Object storage binding |
-| `queue` | Queue | `name`, `service` | Message queue binding |
-| `fromEnvironment` | Env variable | `name` | Load from `.env` file (added automatically for `env` array entries) |
-| `text` | Text binding | `name`, `text` | Static string value |
-| `json` | JSON binding | `name`, `json` | Static JSON value |
-| `memoryCache` | Memory cache | `name`, `id` | In-memory cache binding |
-| `unsafeEval` | Unsafe eval | `name` | Permits `eval()` in worker |
-| `hyperdrive` | Database proxy | `name`, `designator`, `database`, `user`, `password`, `scheme` | PostgreSQL/MySQL proxy |
-| `cryptoKey` | Crypto key | `name`, `algorithm`, `jwk` or `hex` or `file` | Named crypto key |
-| `analyticsEngine` | Analytics engine | `name`, `service` | Analytics binding |
-
-### Module Type Detection
-
-The config generator auto-detects module type by scanning the entrypoint file:
-- If the file starts with `import` or `export`, it's treated as an ES module
-- Otherwise, it's treated as a service worker
-- Override with `"moduleType": "esm"` or `"moduleType": "service-worker"` in manifest
-
-## Environment Variables
-
-Create a `.env` file alongside `worker.js`:
+### werkerd deploy
 
 ```bash
-# /etc/workerd/workers/my-worker/.env
-SECRET_KEY=sk-abc123def456
-API_ENDPOINT=https://api.example.com
+werkerd deploy [--port <port>]
 ```
 
-The `workerd-start` script sources this file before launching workerd. Only variables listed in the manifest's `env` array are exposed to the worker via `env.VAR_NAME`.
+What it does:
+1. Reads `wrangler.jsonc` from current directory2. Auto-bundles with esbuild if the project has npm dependencies3. Generates Cap'n Proto config for workerd4. Copies `.env` from project (if exists) for secrets5. Uploads everything to the server via SCP6. Creates systemd socket unit and starts the service7. Health-checks the endpoint
 
-## Git Deploy Pipeline
+```bash
+# Deploy to default port (8080)
+werkerd deploy
 
-Each worker has a bare git repository at `/var/git/<name>.git` with a `post-receive` hook:
+# Deploy to a specific port
+werkerd deploy --port 3000
+```
 
-1. Developer pushes to `main` branch
-2. Hook checks out `worker.js` to `/etc/workerd/workers/<name>/`
-3. Regenerates Cap'n Proto configs for all active ports
-4. Performs rolling restart across all instances (sequential, 500ms apart)
-5. Zero-downtime: other instances handle traffic during each restart
+The server defaults to `root@18.171.244.124`. Override with:
+```bash
+export WERKERD_SERVER=root@my-server.com
+```
 
-### Setup
+### werkerd whoami
+
+```bash
+werkerd whoami
+```
+
+Shows the current server and deployed workers.
+
+## Server Management
+
+### Scale workers
 
 ```bash
 # On the server
-mkdir -p /var/git/my-worker.git
-cd /var/git/my-worker.git
-git init --bare
-git symbolic-ref HEAD refs/heads/main
-
-# Install the post-receive hook (edit WORKER placeholder)
-cp /path/to/post-receive hooks/post-receive
-sed -i 's/PLACEHOLDER/my-worker/' hooks/post-receive
-chmod +x hooks/post-receive
+workerd-scale up <name> <port>      # Add an instance
+workerd-scale down <name> <port>     # Remove an instance
+workerd-scale list <name>           # Show all ports
 ```
 
-### Deploying
+### View logs
 
 ```bash
-# From your local machine
-git remote add deploy ssh://deploy@18.171.244.124:/var/git/my-worker.git
-git push deploy main
-```
-
-## Caddy Configuration
-
-Caddy provides the reverse proxy layer. Configuration:
-
-- **Auto-generated**: `workerd-gen-caddyfile` reads `/etc/workerd/workers/*/ports` and generates upstream blocks with health-checked load balancing
-- **Manual overrides**: `/etc/caddy/Caddyfile.manual` is appended to the auto-generated config
-- **Health checks**: Workers should expose `/healthz` returning `200 OK`
-
-Example manual Caddyfile entry:
-```
-:80 {
-    reverse_proxy localhost:8080 localhost:8081 {
-        lb_policy       least_conn
-        health_uri      /healthz
-        health_interval 10s
-        health_timeout  3s
-    }
-}
-```
-
-Reload Caddy after changes:
-```bash
-sudo caddy reload --config /etc/caddy/Caddyfile
-```
-
-## Observability
-
-### Logs
-```bash
-# View worker logs
+# Specific worker
 journalctl -u workerd@my-worker:8080 -f
 
-# View all workerd services
+# All workerd services
 journalctl -u 'workerd@*' -f
 
-# View Caddy logs
+# Caddy logs
 journalctl -u caddy -f
 ```
 
-### Metrics
+### System status
+
 ```bash
 # Active services
 systemctl list-units 'workerd@*' --no-legend
@@ -250,8 +200,112 @@ systemctl list-units 'workerd@*' --no-legend
 # Port usage
 ss -tlnp | grep workerd
 
-# Instance count
+# All active ports
 cat /etc/workerd/workers/*/ports
+```
+
+## Examples
+
+All examples are standard npm projects. Deploy with `werkerd deploy`:
+
+### Hello World
+`examples/hello/` — Minimal worker with text binding
+```bash
+cd examples/hello
+werkerd deploy --port 8084
+curl http://18.171.244.124:8084/
+```
+
+### Hono Framework (first-class)
+`examples/hono-app/` — Full Hono app with routing, JSON, HTML
+```bash
+cd examples/hono-app
+npm install
+werkerd deploy --port 8082
+curl http://18.171.244.124:8082/
+```
+
+### Vite + React SSR (first-class)
+`examples/vite-react/` — Vite React app with SSR on workerd
+```bash
+cd examples/vite-react
+npm install
+werkerd deploy --port 8083
+curl http://18.171.244.124:8083/
+```
+
+### Durable Objects + WebSockets
+`examples/fullstack/` — DO Counter, WebSocket ChatRoom, env vars
+```bash
+cd examples/fullstack
+werkerd deploy --port 8085
+curl http://18.171.244.124:8085/diag
+```
+
+### Service Bindings
+`examples/api/` — API worker calling auth worker via `env.AUTH.fetch()`
+```bash
+# On server: workerd-scale up api 8090
+curl http://18.171.244.124:8090/diag
+```
+
+## Environment Variables & Secrets
+
+### Text bindings (in wrangler.jsonc)
+For non-sensitive config values:
+```jsonc
+{ "vars": { "GREETING": "Hello!" } }
+```
+Values are embedded in the Cap'n Proto config. Available as `env.GREETING`.
+
+### Secrets (.env file)
+For sensitive values, create a `.env` file in your project:
+```bash
+# .env
+SECRET_KEY=sk-abc123
+DATABASE_URL=postgres://...
+```
+The CLI copies this to the server. The `workerd-start` script sources it before launching workerd. Available via `fromEnvironment` binding in the config.
+
+## Binding Types
+
+| Type | wrangler key | Cap'n Proto | Purpose |
+|------|-------------|-------------|---------|
+| Text | `vars` | `(name = "X", text = "Y")` | Static string values |
+| Service | `services` | `(name = "X", service = "Y")` | Call another worker |
+| Durable Object | `durable_objects.bindings` | `(name = "X", durableObjectNamespace = ...)` | DO access |
+| KV namespace | `kv_namespaces` | `(name = "X", kvNamespace = ...)` | KV storage |
+| R2 bucket | `r2_buckets` | `(name = "X", r2Bucket = ...)` | Object storage |
+| D1 database | `d1_databases` | Wrapped binding | SQLite database |
+| Queue | `queues.producers` | `(name = "X", queue = ...)` | Message queues |
+
+## File System Layout (Server)
+
+```
+/etc/workerd/
+  workers/
+    <name>/
+      index.js              ← Uploaded by CLI
+      config.<port>.capnp   ← Generated per port
+      .env                  ← Secrets (copied from project)
+      ports                 ← Active port list (one per line)
+
+/var/git/
+  <name>.git/               ← Bare git repo for deploy (optional legacy)
+
+/usr/local/bin/
+  workerd-gen-config        ← Config generator (legacy manifest.json mode)
+  workerd-start             ← systemd ExecStart wrapper
+  workerd-scale             ← Scale manager
+  workerd-gen-caddyfile     ← Caddyfile generator
+
+/etc/systemd/system/
+  workerd@.service          ← Template service unit
+  workerd-<name>-<port>.socket  ← Per-instance socket unit
+
+/etc/caddy/
+  Caddyfile                 ← Auto-generated + manual
+  Caddyfile.manual          ← User overrides
 ```
 
 ## Troubleshooting
@@ -263,128 +317,71 @@ journalctl -u workerd@my-worker:8080 -n 50
 ```
 
 Common causes:
-- **Config validation error**: Run `workerd compile config.8080.capnp` to validate
-- **Missing embed file**: Ensure `worker.js` exists and paths are relative to config file
-- **Port in use**: Check with `ss -tlnp | grep <port>`
-- **Binding mismatch**: Binding names in manifest must match worker code's `env.NAME` references
+- **Config validation error**: `workerd compile config.8080.capnp`
+- **Missing embed file**: Ensure `index.js` exists, path is relative to config
+- **Port in use**: `ss -tlnp | grep <port>`
+- **Binding mismatch**: Binding names in wrangler.jsonc must match worker code
 
 ### Socket activation not triggering
 ```bash
 systemctl status workerd-my-worker-8080.socket
-ss -tlnp | grep 8080  # should show systemd listening
+ss -tlnp | grep <port>  # should show systemd listening
 ```
 
-### Caddy not routing
+### Reset a broken service
 ```bash
-caddy validate --config /etc/caddy/Caddyfile
-curl -sv http://localhost:<port>/  # test direct access first
-```
-
-### Git push deploy not updating
-```bash
-cat /var/git/my-worker.git/hooks/post-receive  # verify WORKER name
-sudo git --git-dir=/var/git/my-worker.git log --oneline  # verify commits
-```
-
-## File System Layout
-
-```
-/etc/workerd/
-  workers/
-    <name>/
-      worker.js           ← Entrypoint (deployed via git push)
-      manifest.json        ← Worker configuration
-      config.<port>.capnp  ← Generated Cap'n Proto config
-      .env                 ← Environment variables (optional)
-      ports                ← Active port list (one per line)
-      group-<name>.js      ← Group member workers (copied from sibling dirs)
-
-/var/lib/workerd/
-  workers/                 ← Durable Object storage (if using localDisk)
-
-/var/git/
-  <name>.git/              ← Bare git repo for each worker
-    hooks/post-receive     ← Deploy hook
-
-/usr/local/bin/
-  workerd-gen-config       ← Config generator
-  workerd-start             ← systemd exec wrapper
-  workerd-scale             ← Scale manager
-  workerd-gen-caddyfile     ← Caddyfile generator
-  workerd-deploy            ← Manual deploy CLI
-
-/etc/systemd/system/
-  workerd@.service         ← Template service unit
-  workerd-<name>-<port>.socket  ← Per-instance socket unit
-
-/etc/caddy/
-  Caddyfile                ← Auto-generated + manual entries
-  Caddyfile.manual         ← User overrides
+systemctl stop workerd-my-worker-8080.socket
+systemctl reset-failed workerd@my-worker:8080.service
+# Redeploy or restart
 ```
 
 ## Bootstrap (New Server)
 
 ```bash
-# 1. Copy all management scripts to /tmp/werkerd-scripts/
-scp management-scripts/* ubuntu@<host>:/tmp/werkerd-scripts/
+# 1. Copy scripts
+scp management-scripts/* root@<host>:/tmp/werkerd-scripts/
 
 # 2. Run bootstrap
-ssh ubuntu@<host> sudo bash /tmp/werkerd-scripts/bootstrap.sh
+ssh root@<host> bash /tmp/werkerd-scripts/bootstrap.sh
 
-# 3. Create Caddyfile
-sudo tee /etc/caddy/Caddyfile.manual << 'EOF'
-:80 {
-    reverse_proxy localhost:8080 {
-        health_uri /healthz
-    }
-}
-EOF
-sudo /usr/local/bin/workerd-gen-caddyfile
-sudo caddy reload --config /etc/caddy/Caddyfile
+# 3. Install the CLI on your machine
+cd werkerd-cli && npm install && npm link
 
-# 4. Deploy first worker
-sudo /usr/local/bin/workerd-scale up hello 8080
-
-# 5. Test
-curl http://localhost:8080/
+# 4. Deploy!
+cd examples/hello && werkerd deploy --port 8080
 ```
 
 ## Supported Features
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ES Modules | Supported | Auto-detected from source |
-| Service Workers | Supported | `addEventListener("fetch", ...)` pattern |
-| Service Bindings | Supported | `env.NAME.fetch()` to call other workers in the same group |
-| Durable Objects | Supported | Binding type `durableObjectNamespace` |
-| KV Namespaces | Supported | Binding type `kvNamespace` (local in-memory or external service) |
-| R2 Buckets | Supported | Binding type `r2Bucket` |
-| Queues | Supported | Binding type `queue` |
-| WebSockets | Supported | `new WebSocketPair()`, chatroom pattern |
-| Environment Variables | Supported | `.env` file + `env` array in manifest |
-| Text/JSON Bindings | Supported | Static config values |
-| Hyperdrive | Supported | Database proxy binding |
-| Memory Cache | Supported | In-memory key-value cache |
-| Crypto Keys | Supported | JWK, hex, or raw file |
-| Analytics Engine | Supported | Binding to analytics service |
-| Unsafe Eval | Supported | Opt-in `eval()` permission |
+| ES Modules | Supported | `export default { fetch }` |
+| Service Workers | Supported | `addEventListener("fetch", ...)` |
+| Hono | First-class | Full Hono framework support |
+| Vite + React SSR | First-class | Build + deploy workflow |
+| SvelteKit SSR | Supported | Build output as ES module |
+| Service Bindings | Supported | `env.NAME.fetch()` |
+| Durable Objects | Supported | Per-worker namespace, in-memory storage |
+| WebSockets | Supported | `new WebSocketPair()` |
+| Environment Variables | Supported | `.env` file + text bindings |
+| KV Namespaces | Supported | Requires backend service |
+| R2 Buckets | Supported | Requires backend service |
 | Zero-downtime Deploy | Supported | Rolling restart via systemd |
 | Socket Activation | Supported | systemd socket units |
-| Caddy LB | Supported | Health-checked load balancing |
-| Git Push Deploy | Supported | Post-receive hook |
+| Caddy LB | Supported | Health-checked reverse proxy |
 | Scale Up/Down | Supported | `workerd-scale` CLI |
-| SvelteKit SSR | Supported | Hybrid rendering via `adapter-cloudflare` output |
+| esbuild bundling | Supported | Auto-detects npm deps |
 
 ## Known Limitations
 
-1. **Config-level DO fields**: `durableObjectNamespaces` and `durableObjectStorage` at the Config struct level are not yet supported by the current workerd binary. Durable Objects work via Worker-level binding only.
+1. **KV, R2, D1 require backend services**: These bindings point to a service name. You need to configure the corresponding backend (or use in-memory stubs). The binding itself works — the backend is what you wire up.
 
-2. **No secrets manager**: Environment variables stored in `.env` files on disk. No built-in secrets vault integration yet.
+2. **DO storage is in-memory**: Durable Object state persists only for the process lifetime. For production, configure `localDisk` or an external storage backend.
 
-3. **No Cloudflare Dashboard**: This is purely self-hosted — no UI for managing deployments.
+3. **No Cloudflare Dashboard**: Purely self-hosted. No UI for managing deployments.
 
 4. **Single binary per instance**: Each systemd instance runs one workerd process. Group workers share the same process isolate.
 
-5. **No global replication**: Durable Objects stored locally. No cross-server replication.
+5. **No cross-server replication**: Durable Objects stored locally. No automatic replication across servers.
 
-6. **Caddy reload resets connections**: `caddy reload` may briefly drop active connections. Use with caution in production.]]>
+6. **Caddy reload may drop connections**: Use with caution in production. Consider zero-downtime Caddy restart strategies.

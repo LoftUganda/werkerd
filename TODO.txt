@@ -24,6 +24,25 @@ push to: https://github.com/LoftUganda/werkerd
 
 
 
+can you implement the KV to be self-hosted redis
+
+
+would it be the same to just use wrangler deploy dry run to ensure we support more things we may forget in our own, i've looked at some of the project i want to push, u have say ~/akabbo with env:kenya and for cloudflare i do wrangler deploy --env kenya. 
+which i better, to just leave the feature not implemented, or just use wrangler deploy dry run to ensure we support more things we may forget in our own
+i am trusting with the responsibility to make this decision, dont be a sychophant or some kind of stupid nincompoomp
+
+
+
+Validate the scaling wth load tests, need to clear a million rps easy 
+
+
+I dont know what you mean CLI-compatible wrangler.jsonc.
+This is supposed to be drop-in, and if some more info needed or something, then there can be another config, i still need to be able to work with the Cloudflare workers 
+
+
+
+update the docs and push to github
+
 
 
 ensure will survive reboot 
