@@ -1,0 +1,139 @@
+#!/bin/bash
+# /usr/local/bin/workerd-multiplex
+# Manages N workerd processes on a single port with kernel-level load balancing (SO_REUSEPORT).
+# Reads desired instances from /etc/workerd/workers/<worker>/scale
+# Watchdog: restarts crashed instances automatically.
+# Usage: workerd-multiplex <worker> <port>
+
+set -euo pipefail
+
+WORKER="$1"
+PORT="$2"
+BASE_DIR="/etc/workerd/workers/${WORKER}"
+SCALE_FILE="${BASE_DIR}/scale"
+CONFIG="${BASE_DIR}/config.${PORT}.capnp"
+ENV_FILE="${BASE_DIR}/.env"
+PIDS_DIR="/run/workerd-${WORKER}-${PORT}"
+
+# Load .env if present
+[ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
+
+get_instances() {
+    if [ -f "$SCALE_FILE" ]; then
+        cat "$SCALE_FILE" | tr -d ' '
+    else
+        echo "1"
+    fi
+}
+
+spawn_instance() {
+    local id=$1
+    local pid_file="${PIDS_DIR}/${id}.pid"
+
+    # Skip if already running
+    if [ -f "$pid_file" ]; then
+        local old_pid=$(cat "$pid_file")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # Start workerd
+    /usr/bin/workerd serve "$CONFIG" --socket-fd http=3 >> /var/log/workerd-${WORKER}-${PORT}.log 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$pid_file"
+    echo "  spawned instance ${id} PID=${new_pid}"
+}
+
+kill_instance() {
+    local id=$1
+    local pid_file="${PIDS_DIR}/${id}.pid"
+
+    [ -f "$pid_file" ] || return 0
+
+    local pid=$(cat "$pid_file")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        # Wait up to 3s for graceful shutdown
+        for i in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        # Force kill if still alive
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+kill_all() {
+    for pidfile in "${PIDS_DIR}"/*.pid 2>/dev/null; do
+        [ -f "$pidfile" ] || continue
+        local pid=$(cat "$pidfile")
+        kill "$pid" 2>/dev/null || true
+    done
+    rm -rf "$PIDS_DIR"
+}
+
+sync_instances() {
+    local desired=$(get_instances)
+    local current
+
+    if [ -d "$PIDS_DIR" ]; then
+        current=$(ls -1 "${PIDS_DIR}"/*.pid 2>/dev/null | wc -l | tr -d ' ')
+    else
+        current=0
+    fi
+
+    echo "  ${WORKER}:${PORT} — current=${current} desired=${desired}"
+
+    # Spawn missing instances
+    for i in $(seq 1 "$desired"); do
+        spawn_instance $i
+    done
+
+    # Kill excess instances
+    for i in $(seq $((desired + 1)) 10); do
+        kill_instance $i
+    done
+
+    echo "  ${WORKER}:${PORT} running $(get_instances) instances"
+}
+
+# Trap signals for graceful shutdown
+trap 'echo "→ Caught signal, shutting down..."; kill_all; exit 0' SIGTERM SIGINT SIGQUIT
+
+# Create PIDs directory
+mkdir -p "$PIDS_DIR"
+
+echo "→ workerd-multiplex: ${WORKER}:${PORT}"
+echo "  scale: $(get_instances) instance(s)"
+
+# Initial spawn
+sync_instances
+
+# Watchdog loop — check every 5s that all instances are alive
+while true; do
+    sleep 5
+
+    local desired=$(get_instances)
+    local all_alive=true
+
+    # Check each instance
+    for i in $(seq 1 "$desired"); do
+        local pid_file="${PIDS_DIR}/${i}.pid"
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "  ⚠ instance ${i} (PID ${pid}) died — respawning"
+                all_alive=false
+            fi
+        else
+            echo "  ⚠ instance ${i} missing — spawning"
+            all_alive=false
+        fi
+    done
+
+    if [ "$all_alive" = false ]; then
+        sync_instances
+    fi
+done

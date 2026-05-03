@@ -1,93 +1,257 @@
 #!/bin/bash
 # /usr/local/bin/workerd-scale
+# Git-driven scaling for workerd workers.
+# Edit /etc/workerd/workers/<worker>/scale and push to apply changes.
+#
+# Scaling only improves throughput if you have more CPU cores than instances.
+# On a 2-core VM: 1 instance saturates the CPU. Scaling to 2 doesn't help.
+# On a 4-core VM: 1 instance = 25% CPU, 4 instances = 100% CPU = ~4x RPS.
+#
 # Usage:
-#   workerd-scale up   <worker> <port>   — add an instance
-#   workerd-scale down <worker> <port>   — remove an instance
-#   workerd-scale list <worker>          — show running instances
+#   workerd-scale set <worker> <N>  — set N instances (git-push driven)
+#   workerd-scale start <worker> <port> — start worker (reads scale file)
+#   workerd-scale stop <worker>      — stop all instances
+#   workerd-scale list <worker>      — show scale and running PIDs
+#   workerd-scale info               — show CPU cores and scaling advice
 
 set -euo pipefail
 
-ACTION=$1
-WORKER=$2
+ACTION=${1:-}
+WORKER=${2:-}
 PORT=${3:-}
-PORTS_FILE="/etc/workerd/workers/$WORKER/ports"
-SOCKET_UNIT="workerd-${WORKER}-${PORT}.socket"
-SERVICE_UNIT="workerd@${WORKER}:${PORT}.service"
+SERVER_INFO_FILE="/etc/workerd/workers/.server_info"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-case $ACTION in
-  up)
-    [ -z "$PORT" ] && die "port required"
+get_scale() {
+    if [ -f "/etc/workerd/workers/${WORKER}/scale" ]; then
+        cat "/etc/workerd/workers/${WORKER}/scale" | tr -d ' '
+    else
+        echo "1"
+    fi
+}
 
-    # Check port is not already in use by another worker
-    if ss -tlnp | grep -q ":${PORT}\b"; then
-        die "Port $PORT is already in use"
+get_ports() {
+    if [ -f "/etc/workerd/workers/${WORKER}/ports" ]; then
+        cat "/etc/workerd/workers/${WORKER}/ports"
+    fi
+}
+
+allocate_port() {
+    local start=${1:-8080}
+    local end=$((start + 99))
+    for p in $(seq "$start" "$end"); do
+        if ! ss -tlnp | grep -q ":${p}\b"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+sync_instances() {
+    local desired=$(get_scale)
+    local current_ports
+    current_ports=$(get_ports)
+    local current_count
+    current_count=$(echo "$current_ports" | grep -c . 2>/dev/null || echo 0)
+
+    if [ "$desired" -eq "$current_count" ]; then
+        echo "  → Scale unchanged (${desired} instances)"
+        return 0
     fi
 
-    # Ensure worker directory exists
+    echo "  → Scaling ${WORKER}: ${current_count} → ${desired} instances"
+
+    if [ "$desired" -gt "$current_count" ]; then
+        # Need more ports
+        local port_file="/etc/workerd/workers/${WORKER}/ports"
+        for i in $(seq 1 $((desired - current_count))); do
+            # Find an unused port starting from 8080 + current count
+            local new_port
+            new_port=$(allocate_port $((8080 + current_count + i - 1)))
+            [ -n "$new_port" ] || continue
+
+            echo "$new_port" >> "$port_file"
+
+            # Generate config if needed
+            if [ ! -f "/etc/workerd/workers/${WORKER}/config.${new_port}.capnp" ]; then
+                if [ -f "/etc/workerd/workers/${WORKER}/manifest.json" ]; then
+                    /usr/local/bin/workerd-gen-config "$WORKER" "$new_port"
+                fi
+            fi
+
+            # Create socket unit
+            if [ ! -f "/etc/systemd/system/workerd-${WORKER}-${new_port}.socket" ]; then
+            cat > "/etc/systemd/system/workerd-${WORKER}-${new_port}.socket" << SOCKEOF
+[Unit]
+Description=Socket for workerd ${WORKER}:${new_port}
+[Socket]
+ListenStream=0.0.0.0:${new_port}
+NoDelay=true
+Service=workerd@${WORKER}:${new_port}.service
+[Install]
+WantedBy=sockets.target
+SOCKEOF
+            fi
+
+            systemctl daemon-reload
+            systemctl enable --now "workerd-${WORKER}-${new_port}.socket" 2>/dev/null || true
+            echo "    + :${new_port}"
+        done
+    else
+        # Scale down
+        local ports_array
+        IFS=$'\n' read -r -d '' -a ports_array <<< "$current_ports" || true
+        for i in $(seq $((${#ports_array[@]} - 1)) -1 0); do
+            [ "$desired" -ge $(($i + 1)) ] && break
+            local p=${ports_array[$i]}
+            systemctl stop "workerd-${WORKER}-${p}.socket" 2>/dev/null || true
+            systemctl disable "workerd-${WORKER}-${p}.socket" 2>/dev/null || true
+            rm -f "/etc/systemd/system/workerd-${WORKER}-${p}.socket"
+            echo "    - :${p}"
+        done
+        systemctl daemon-reload
+        echo "$current_ports" | head -n "$desired" > "/etc/workerd/workers/${WORKER}/ports"
+    fi
+
+    # Regenerate nginx config
+    /usr/local/bin/workerd-gen-nginx
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+
+    echo "  ✓ ${WORKER} scaled to ${desired} instances"
+}
+
+case $ACTION in
+  info)
+    show_info()
+    {
+        local cores=$(nproc)
+        echo "Server CPU cores: ${cores}"
+        echo ""
+        echo "Scaling advice:"
+        if [ "$cores" -eq 1 ]; then
+            echo "  1 core: scaling won't help. Deploy to more cores."
+        elif [ "$cores" -eq 2 ]; then
+            echo "  2 cores: scaling gives marginal benefit (context switching)."
+            echo "           For meaningful improvement: deploy to 4+ core VM."
+        elif [ "$cores" -ge 4 ]; then
+            echo "  ${cores} cores: scaling works well. Set instances = cores for best RPS."
+        fi
+        echo ""
+        echo "Each workerd instance is single-threaded and uses 1 core."
+        echo "To reach 1M RPS: need ~120 cores behind nginx (~8k RPS/core)."
+    }
+    show_info
+    ;;
+
+  set)
+    [ -z "$WORKER" ] && die "worker name required"
+    [ -z "$PORT" ] && die "instance count (N) required"
+    mkdir -p "/etc/workerd/workers/$WORKER"
+    echo "$PORT" > "/etc/workerd/workers/$WORKER/scale"
+    echo "  scale set: ${WORKER} = ${PORT} instance(s)"
+    sync_instances
+    ;;
+
+  start)
+    [ -z "$WORKER" ] && die "worker name required"
+    [ -z "$PORT" ] && die "port required"
     mkdir -p "/etc/workerd/workers/$WORKER"
 
-    # Add to ports file if not already there
-    grep -qxF "$PORT" "$PORTS_FILE" 2>/dev/null || echo "$PORT" >> "$PORTS_FILE"
+    if [ ! -f "/etc/workerd/workers/${WORKER}/scale" ]; then
+        echo "1" > "/etc/workerd/workers/${WORKER}/scale"
+    fi
 
-    # Generate config for this instance
-    /usr/local/bin/workerd-gen-config "$WORKER" "$PORT"
+    if [ ! -f "/etc/workerd/workers/${WORKER}/ports" ]; then
+        echo "$PORT" > "/etc/workerd/workers/${WORKER}/ports"
+    fi
 
-    # Create socket unit file
-    cat > "/etc/systemd/system/${SOCKET_UNIT}" << SOCKETEOF
+    # Create manifest.json if it doesn't exist (needed for config generation)
+    if [ ! -f "/etc/workerd/workers/${WORKER}/manifest.json" ]; then
+        cat > "/etc/workerd/workers/${WORKER}/manifest.json" << MANIFEST
+{
+  "name": "${WORKER}",
+  "entrypoint": "index.js",
+  "compatibilityDate": "2024-09-23"
+}
+MANIFEST
+    fi
+
+    if [ ! -f "/etc/workerd/workers/${WORKER}/config.${PORT}.capnp" ]; then
+        /usr/local/bin/workerd-gen-config "$WORKER" "$PORT"
+    fi
+
+    if [ ! -f "/etc/systemd/system/workerd-${WORKER}-${PORT}.socket" ]; then
+    cat > "/etc/systemd/system/workerd-${WORKER}-${PORT}.socket" << SOCKEOF
 [Unit]
 Description=Socket for workerd ${WORKER}:${PORT}
-
 [Socket]
 ListenStream=0.0.0.0:${PORT}
 NoDelay=true
-Service=${SERVICE_UNIT}
-
+Service=workerd@${WORKER}:${PORT}.service
 [Install]
 WantedBy=sockets.target
-SOCKETEOF
+SOCKEOF
+    fi
 
     systemctl daemon-reload
-    systemctl enable --now "$SOCKET_UNIT"
+    systemctl enable --now "workerd-${WORKER}-${PORT}.socket"
 
-    # Regenerate Caddyfile
-    /usr/local/bin/workerd-gen-caddyfile
-    caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+    /usr/local/bin/workerd-gen-nginx
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 
-    echo "✔  ${SERVICE_UNIT} started on port ${PORT}"
+    echo "  ✓ ${WORKER} started on :${PORT} ($(get_scale) instance(s))"
     ;;
 
-  down)
-    [ -z "$PORT" ] && die "port required"
-
-    systemctl stop    "$SERVICE_UNIT" 2>/dev/null || true
-    systemctl disable "$SERVICE_UNIT" 2>/dev/null || true
-    systemctl stop    "$SOCKET_UNIT"  2>/dev/null || true
-    systemctl disable "$SOCKET_UNIT"  2>/dev/null || true
-    rm -f "/etc/systemd/system/${SOCKET_UNIT}"
+  stop)
+    [ -z "$WORKER" ] && die "worker name required"
+    local ports
+    ports=$(get_ports)
+    for p in $ports; do
+        systemctl stop "workerd-${WORKER}-${p}.socket" 2>/dev/null || true
+        systemctl disable "workerd-${WORKER}-${p}.socket" 2>/dev/null || true
+        rm -f "/etc/systemd/system/workerd-${WORKER}-${p}.socket"
+    done
     systemctl daemon-reload
 
-    # Remove from ports file
-    sed -i "/^${PORT}$/d" "$PORTS_FILE"
+    /usr/local/bin/workerd-gen-nginx
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 
-    # Regenerate Caddyfile
-    /usr/local/bin/workerd-gen-caddyfile
-    caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
-
-    echo "✔  ${SERVICE_UNIT} stopped"
+    echo "  ✓ ${WORKER} stopped"
     ;;
 
   list)
-    echo "Active instances for $WORKER:"
-    systemctl list-units "workerd@${WORKER}:*" --no-legend --state=active 2>/dev/null || true
+    [ -z "$WORKER" ] && die "worker name required"
+    echo "Worker: ${WORKER}"
+    echo "  Desired scale: $(get_scale) instance(s)"
+    echo "  Ports: $(get_ports | tr '\n' ' ')"
+    echo "  Running services:"
+    systemctl list-units "workerd@${WORKER}:*" --no-legend --state=active 2>/dev/null || echo "    (none)"
+    ;;
+
+  help|--help|-h)
+    echo "workerd-scale — git-driven worker scaling"
     echo ""
-    echo "Registered ports:"
-    cat "$PORTS_FILE" 2>/dev/null || echo "  (no ports file)"
+    echo "Usage:"
+    echo "  workerd-scale info              — show CPU cores and scaling advice"
+    echo "  workerd-scale set <worker> <N>  — set N instances (git-push workflow)"
+    echo "  workerd-scale start <worker> <port> — start worker"
+    echo "  workerd-scale stop <worker>     — stop all instances"
+    echo "  workerd-scale list <worker>     — show status"
+    echo ""
+    echo "Git-push workflow:"
+    echo "  1. Edit scale file locally: echo 2 > hello/scale"
+    echo "  2. Push to server (via deploy hook or rsync)"
+    echo "  3. On server: workerd-scale set hello 2"
+    echo ""
+    echo "Scaling only improves RPS if you have more CPU cores than instances."
+    echo "workerd is single-threaded — 1 core per instance."
     ;;
 
   *)
-    echo "Usage: workerd-scale up|down|list <worker> [port]"
+    echo "Usage: workerd-scale info|set|start|stop|list <worker> [N|port]"
+    echo "Run 'workerd-scale help' for full usage."
     exit 1
     ;;
 esac

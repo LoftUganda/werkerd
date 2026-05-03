@@ -1,320 +1,466 @@
-# Troubleshooting
+# Troubleshooting Guide
+
+## Quick Diagnostics
+
+```bash
+# Everything running?
+systemctl status nginx
+systemctl list-units 'workerd@*' --no-legend --state=active | wc -l
+
+# All workers healthy?
+for port in 8080 8081 8082 8083 8085; do
+  curl -sf http://localhost:$port/healthz && echo " :$port OK" || echo " :$port FAIL"
+done
+
+# nginx routing working?
+curl -sf http://hello.localhost/ && echo " hello OK" || echo " hello FAIL"
+curl -sf http://hono-app.localhost/ && echo " hono OK" || echo " hono FAIL"
+
+# nginx status
+curl -s http://localhost/nginx_status
+```
+
+---
 
 ## Service Not Starting
 
-### Symptom: Socket is listening but service is not active
-```
+### Socket is listening but service inactive
+
+```bash
 systemctl status workerd@hello:8080.service
-→ inactive (dead)
+# → inactive (dead)
 ```
 
 **Check**: Is socket activation blocked?
+
 ```bash
 systemctl status workerd-hello-8080.socket
 ```
 
-**Fix**: Trigger activation by making a request:
+**Fix**: Trigger activation manually:
+
 ```bash
 curl http://localhost:8080/
 ```
 
-### Symptom: Service is failed
-```
-systemctl status workerd@hello:8080.service
-→ failed (Result: exit-code)
-```
+### Service is failed
 
-**Check journal**:
 ```bash
+systemctl status workerd@hello:8080.service
+# → failed (Result: exit-code)
 journalctl -u workerd@hello:8080.service -n 50 --no-pager
 ```
 
-Common failures:
+**Common errors and fixes**:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `No such file: config.<port>.capnp` | Config not generated | `workerd-gen-config hello 8080` |
-| `embed path not found: worker.js` | Worker file missing | Check `/etc/workerd/workers/hello/worker.js` exists |
-| `ES module parse error` | Service Worker format used with `modules` | Set `"moduleType": "classic"` in manifest or use `export default` |
-| `durableObjectNamespaces not recognized` | Old workerd binary | Remove `durableObjectNamespaces` from Config level |
-| `embed cannot contain ".."` | Relative path escaping | Config generator copies group members locally |
+| `No such file: config.8080.capnp` | Config not generated | `workerd-gen-config hello 8080` |
+| `embed path not found: index.js` | Worker file missing | Check `/etc/workerd/workers/hello/index.js` exists |
+| `ES module parse error` | Wrong module type | Set `"main"` correctly in wrangler.jsonc |
+| `embed cannot contain ".."` | Relative path escaping | Config generator handles this |
+| `fromEnvironment: not found` | Env var not in manifest | Add to manifest's `env` array |
 
-### Symptom: Service starts but immediately dies
-```
+### Service starts but immediately dies
+
+```bash
 journalctl -u workerd@hello:8080.service
-→ Exited with code 1, retrying
+# → Exited with code 1, retrying
 ```
 
-Check `.env` file syntax:
+**Check .env file syntax**:
+
 ```bash
 cat /etc/workerd/workers/hello/.env
-# Must be KEY=VALUE one per line, no spaces around =
+# Must be KEY=VALUE, one per line, no spaces around =
+# CORRECT:  SECRET_KEY=abc123
+# WRONG:    SECRET_KEY = abc123
 ```
+
+---
 
 ## Port Already in Use
 
 ```bash
 ss -tlnp | grep :8080
-# Shows something already on 8080
+# Shows what's using the port
 
 # Kill it
 sudo fuser -k 8080/tcp
 
 # Or use a different port
-sudo workerd-scale up hello 8082
+werkerd deploy --port 8086
 ```
 
-## Caddy Not Proxying
+---
 
-### Symptom: Direct port works but Caddy returns 502
-```bash
-curl localhost:8080/   → works
-curl localhost:80/     → 502
-```
+## nginx Not Proxying
 
-**Check Caddyfile**:
-```bash
-cat /etc/caddy/Caddyfile
-systemctl status caddy
-```
-
-**Fix**: Regenerate and reload:
-```bash
-workerd-gen-caddyfile
-caddy reload --config /etc/caddy/Caddyfile
-```
-
-If Caddy complains about `lb_policy`:
-```bash
-# Remove the lb_policy line temporarily
-sed -i '/lb_policy/d' /etc/caddy/Caddyfile
-caddy fmt --overwrite /etc/caddy/Caddyfile
-caddy reload --config /etc/caddy/Caddyfile
-```
-
-### Symptom: External IP works but domain doesn't
-```bash
-curl http://18.171.244.124/  → works
-curl http://hello.example.com/ → connection refused
-```
-
-DNS is not configured. Either:
-1. Set up DNS pointing to the server IP
-2. Add the domain to Caddyfile and reload
-
-## Caddy Performance Issues
-
-### Symptom: High latency through Caddy LB
-
-```
-Direct workerd (localhost:8080): 5ms
-Caddy LB (localhost:80): 50ms+        # >10x slower than direct
-```
-
-**Check**: Are connection pooling and keepalive enabled?
+### Symptom: Direct works, nginx returns 502
 
 ```bash
-# Check current Caddy config
-cat /etc/caddy/Caddyfile | grep -A10 "transport http"
+curl http://localhost:8080/          # works
+curl http://hello.localhost/         # 502 Bad Gateway
 ```
 
-**Fix**: Regenerate Caddyfile with connection pooling:
-```bash
-workerd-gen-caddyfile
-caddy reload --config /etc/caddy/Caddyfile
-```
-
-The optimized config adds `transport http` blocks with `keepalive 30s`, `max_conns_per_host 200`, and `keepalive_idle_conns 100`. This eliminates the TCP 3-way handshake per request.
-
-**Expected improvement**: 2,893 → 4,425 RPS (+53%), p99 from 757ms → 114ms (-85%)
-
-### Symptom: Caddy returns 502 under load
-
-```
-Under heavy load: 502 Bad Gateway
-```
-
-**Common causes**:
-
-| Cause | Diagnosis | Fix |
-|---|---|---|
-| Connection exhaustion | `ss -s` shows high established | Increase `max_conns_per_host` |
-| FD limit hit | `ls /proc/$(pgrep caddy)/fd \| wc -l` near limit | `LimitNOFILE=65536` in systemd |
-| Upstream saturated | Workerd CPU at 100% | Scale more instances |
-| Health check timeout | `curl localhost:2019/metrics \| grep healthy` shows 0 | Check `/healthz` on all backends |
-| GC pauses | Memory growth over time | Check Go runtime: `GODEBUG=gctrace=1` |
-
-### Diagnostic Commands
+**Diagnose**:
 
 ```bash
-# Caddy metrics (requires admin API enabled)
-curl -s http://localhost:2019/metrics | grep -E "reverse_proxy|upstream"
+# 1. Check nginx is running
+systemctl status nginx
 
-# Active connections breakdown
-ss -s
+# 2. Test nginx config
+nginx -t
 
-# File descriptor count
-ls /proc/$(pgrep caddy)/fd | wc -l
+# 3. Check nginx logs
+tail /var/log/nginx/workerd-error.log
 
-# Established TCP connections
-netstat -an | grep ESTABLISHED | wc -l
-
-# Check OS limits
-cat /proc/$(pgrep caddy)/limits | grep "open files"
-
-# Per-port throughput (while under load)
-for port in 8080 8081; do
-  echo -n ":$port → $(curl -s -o /dev/null -w '%{time_total}s' localhost:$port/)$port "
-done
+# 4. Check upstream config
+cat /etc/nginx/sites-available/workerd | grep -A10 "upstream workerd_hello"
 ```
 
-### Benchmarking
+**Fix**:
 
 ```bash
-# Baseline: direct workerd
-wrk -t2 -c100 -d15s --latency http://localhost:8080/
-
-# Through Caddy LB
-wrk -t2 -c200 -d15s --latency http://localhost:80/
-
-# External (real-world)
-wrk -t4 -c100 -d15s --latency http://<public-ip>:8080/
+# Regenerate nginx config
+workerd-gen-nginx
+nginx -t && systemctl reload nginx
 ```
 
-## Git Push Failing
+### Symptom: nginx 403 Forbidden on /nginx_status
 
-### Symptom: Permission denied (publickey)
+This is expected — `/nginx_status` is restricted to `127.0.0.1`. From outside the server:
+
+```bash
+ssh root@18.171.244.124 'curl http://localhost/nginx_status'
 ```
+
+### Symptom: nginx 502 only under load
+
+```bash
+# Check if upstream is saturated
+ss -s | grep ESTABLISHED
+
+# Check workerd CPU
+top -p $(pgrep -f "workerd serve")
+```
+
+**Fix**: Scale up (if you have more CPU cores):
+
+```bash
+workerd-scale set hello 2
+```
+
+---
+
+## Scaling Issues
+
+### workerd-scale set does nothing
+
+```bash
+# Check scale file
+cat /etc/workerd/workers/hello/scale
+
+# Check running instances
+workerd-scale list hello
+
+# Apply manually
+workerd-scale set hello 2
+```
+
+### Scaling doesn't improve RPS
+
+This is **expected on 2-core VMs**. workerd is single-threaded. On a 2-core VM, multiple instances compete for the same CPU cores due to context switching.
+
+**Check your CPU cores**:
+
+```bash
+workerd-scale info
+# Server CPU cores: 2
+# Scaling advice: marginal benefit (context switching)
+```
+
+**Fix**: Deploy to a server with 4+ cores for linear scaling.
+
+### Scaling up adds ports but no instances start
+
+```bash
+# Check scale file has the right count
+cat /etc/workerd/workers/hello/scale
+
+# Manual apply
+workerd-scale set hello 2
+```
+
+---
+
+## Deployment Failures
+
+### esbuild fails
+
+```bash
+# Make sure npm deps are installed
+npm install
+werkerd deploy --port 8080
+```
+
+### SCP upload fails
+
+```bash
+# Check SSH connectivity
+ssh root@18.171.244.124 'echo connected'
+
+# Check disk space
+ssh root@18.171.244.124 'df -h'
+```
+
+### Health check fails after deploy
+
+```bash
+# Check if service started
+systemctl status workerd@hello:8080.service
+
+# Check logs
+journalctl -u workerd@hello:8080.service -n 20
+
+# Try restarting
+systemctl restart workerd-hello-8080.socket
+```
+
+---
+
+## Git Push Deploy Failing
+
+### Permission denied (publickey)
+
+```bash
 git push deploy main
-→ Permission denied (publickey)
+# → Permission denied (publickey)
 ```
 
 **Fix**: Add your SSH key to the deploy user:
+
 ```bash
-# On server
-sudo -u deploy mkdir -p /home/deploy/.ssh
-cat /home/ubuntu/.ssh/authorized_keys >> /home/deploy/.ssh/authorized_keys
+ssh root@18.171.244.124
+mkdir -p /home/deploy/.ssh
+cat ~/.ssh/authorized_keys >> /home/deploy/.ssh/authorized_keys
+chown -R deploy:deploy /home/deploy/.ssh
 ```
 
-### Symptom: Remote rejected
-```
+### Remote rejected (not a git directory)
+
+```bash
 git push deploy main
-→ remote: fatal: not in a git directory
+# → remote: fatal: not in a git directory
 ```
 
-The bare repo doesn't exist:
+**Fix**: Create the bare repo on the server:
+
 ```bash
-# On server
+ssh root@18.171.244.124
 sudo mkdir -p /var/git/hello.git
 cd /var/git/hello.git
 sudo git init --bare
 sudo git symbolic-ref HEAD refs/heads/main
+sudo chmod +x hooks/post-receive
 ```
 
-### Symptom: Push succeeds but no restart
-```
-git push deploy main
-→ Everything up-to-date
-```
+### Push succeeds but no restart
 
-Either the hook isn't executable or the branch ref didn't match:
 ```bash
-# On server
-ls -la /var/git/hello.git/hooks/post-receive
-# Must be executable: chmod +x
+# Check hook is executable
+ssh root@18.171.244.124 'ls -la /var/git/hello.git/hooks/post-receive'
 
-cat /var/git/hello.git/hooks/post-receive
-# Check `refname = refs/heads/main` matches your push branch
+# Check hook content
+ssh root@18.171.244.124 'cat /var/git/hello.git/hooks/post-receive'
+
+# Run hook manually to test
+ssh root@18.171.244.124 'cd /var/git/hello.git && git --git-dir=. log -1 --oneline'
 ```
 
-## Env Vars Not Working
+---
 
-### Symptom: env.VARIABLE is undefined
-```
-worker.js: env.SECRET_KEY is undefined
+## Environment Variables Not Working
+
+### Symptom: `env.SECRET_KEY is undefined`
+
+```bash
+# 1. Check .env exists on server
+ssh root@18.171.244.124 'cat /etc/workerd/workers/hello/.env'
+
+# 2. Check .env is readable by workerd
+ssh root@18.171.244.124 'ls -la /etc/workerd/workers/hello/.env'
+ssh root@18.171.244.124 'chown workerd:workerd /etc/workerd/workers/hello/.env'
+
+# 3. Check config has the binding
+ssh root@18.171.244.124 'grep -i secret /etc/workerd/workers/hello/config.8080.capnp'
 ```
 
-**Check**:
-1. `.env` file exists: `cat /etc/workerd/workers/hello/.env`
-2. `manifest.json` lists it: `"env": ["SECRET_KEY"]`
-3. Config has `fromEnvironment` binding: `cat config.8080.capnp`
-4. `.env` is readable by workerd user: `chown workerd:workerd .env`
+### Symptom: .env value not updating after change
+
+```bash
+# Restart the service to pick up new values
+systemctl restart workerd-hello-8080.socket
+
+# Or scale to force restart
+workerd-scale set hello 2
+```
+
+---
 
 ## Service Bindings Broken
 
-### Symptom: env.AUTH is undefined
-```
-worker.js: Cannot read properties of undefined (reading 'fetch')
+### Symptom: `env.AUTH is undefined`
+
+```bash
+# 1. Check wrangler.jsonc has the binding
+grep -A5 services examples/api/wrangler.jsonc
+
+# 2. Check config has both workers
+ssh root@18.171.244.124 'cat /etc/workerd/workers/api/config.8090.capnp'
 ```
 
-**Check**:
-1. `manifest.json` has binding: `"bindings": [{ "name": "AUTH", "service": "auth" }]`
-2. Config has dual-service setup (both workers in same config)
-3. Auth worker file exists: `ls /etc/workerd/workers/auth/worker.js`
-4. Auth worker was copied into group: `ls /etc/workerd/workers/api/group-auth.js`
+**Important**: Service bindings only work when both workers are in the **same Cap'n Proto config** (same process). For CLI-deployed workers, service bindings require manual config generation.
 
-### Symptom: Service binding returns error
-```
-Auth worker error: No such file or directory
-```
+### Symptom: Service binding returns "No such file or directory"
 
-Group workers must be in the same directory as the leader worker. The config generator handles this by copying them as `group-{name}.js`.
+The target worker file must exist in the same directory as the calling worker. For `werkerd deploy`, service bindings to separate workers need a custom deployment setup.
+
+---
 
 ## Durable Objects Not Working
 
-### Symptom: DO class not found
-```
-Error: No such Durable Object class: Counter
-```
+### Symptom: `No such Durable Object class: Counter`
 
-**Check**:
-1. `manifest.json` has DO binding: `"bindings": [{ "name": "COUNTER", "durableObjectNamespace": { "className": "Counter" } }]`
-2. Worker exports the class: `export class Counter extends DurableObject { ... }`
-3. DO classes must be exported from the same module as the fetch handler
-
-## Logs
-
-### View service logs
 ```bash
-journalctl -u workerd@hello:8080.service -f     # Follow
-journalctl -u workerd@hello:8080.service -n 50   # Last 50 lines
-journalctl -u 'workerd@hello:*' -n 50            # All instances
+# 1. Check DO binding in wrangler.jsonc
+grep -A3 durable_objects examples/fullstack/wrangler.jsonc
+
+# 2. Check worker exports the class
+grep "class Counter" examples/fullstack/src/index.js
+
+# 3. Check config has the binding
+ssh root@18.171.244.124 'grep -i counter /etc/workerd/workers/fullstack/config.8085.capnp'
 ```
 
-### View Caddy logs
+**Important**: DO classes must be exported from the **same module** that exports `default`.
+
+### Symptom: DO state disappears after restart
+
+This is **expected**. DO storage is in-memory by default. State survives within a process lifetime but not across restarts. For persistence, configure `localDisk` storage.
+
+---
+
+## Logs Reference
+
 ```bash
-journalctl -u caddy -f
-journalctl -u caddy --since "5 minutes ago"
+# All workerd services
+journalctl -u 'workerd@*' -f
+
+# Specific worker (all instances)
+journalctl -u 'workerd@hello:*' -f
+
+# Single instance
+journalctl -u 'workerd@hello:8080.service' -f
+
+# nginx access logs
+tail -f /var/log/nginx/workerd-access.log
+
+# nginx error logs
+tail -f /var/log/nginx/workerd-error.log
 ```
 
-### View deploy logs
-```bash
-# Deploy logs appear in git push output (post-receive stdout)
-# Also check:
-journalctl -u 'workerd@*' --since "1 minute ago"
-```
+---
 
 ## Reset Everything
 
-If things get truly stuck:
-```bash
-# Kill all workerd processes
-sudo pkill -f workerd
+If you're stuck with a completely broken state:
 
-# Stop all socket units
+```bash
+# 1. Stop everything
+systemctl stop 'workerd@*' 2>/dev/null || true
 systemctl stop 'workerd-*-*.socket' 2>/dev/null || true
 
-# Disable all services
+# 2. Disable everything
 systemctl disable 'workerd@*' 2>/dev/null || true
 systemctl disable 'workerd-*-*.socket' 2>/dev/null || true
 
-# Clean up
+# 3. Remove socket units
 rm -f /etc/systemd/system/workerd-*-*.socket
 
-# Reload systemd
+# 4. Reload systemd
 systemctl daemon-reload
 
-# Regenerate everything
-workerd-gen-config hello 8080
-workerd-scale up hello 8080
+# 5. Clean up worker directories (optional)
+rm -rf /etc/workerd/workers/<name>
+
+# 6. Regenerate nginx
+workerd-gen-nginx && systemctl reload nginx
+
+# 7. Redeploy
+werkerd deploy --port 8080
+```
+
+---
+
+## Common Pitfalls
+
+### 1. `.env` syntax must be strict
+
+workerd-start uses `set -a; source .env; set +a`. This requires:
+- `KEY=VALUE` format (no spaces around `=`)
+- One variable per line
+- No trailing whitespace
+- No quotes around values (or they'll be included)
+
+### 2. Scale file uses `\n` literally in heredocs
+
+When generating nginx config, use `printf` or build strings properly. Literal `\n` in heredocs becomes the two characters backslash-n, not a newline.
+
+### 3. workerd is single-threaded
+
+On a 2-core VM, 2 instances compete for CPU via context switching. The performance is similar or worse than 1 instance. Scale only helps on 4+ core machines.
+
+### 4. nginx must be reloaded after config changes
+
+`workerd-gen-nginx` generates the config but nginx won't use it until you run `nginx -t && systemctl reload nginx`.
+
+### 5. vite-react worker overwrites index.js
+
+When deploying workers with npm deps, esbuild bundles node_modules into the output. The bundled file (not the original source) is what gets deployed. This is correct behavior — the bundle is what actually runs on workerd.
+
+### 6. Scaling only helps with more CPU cores
+
+workerd is single-threaded and uses 1 CPU core per instance. On a 2-core VM, 1 instance saturates both cores. Scaling to 2 instances adds context-switching overhead.
+
+### 7. `manifest.json` required for scaling
+
+`workerd-gen-config` (used by `workerd-scale set/start`) reads `manifest.json` from the worker directory. Without it, scaling fails with "manifest.json not found". The `werkerd deploy` CLI now creates this automatically. For manual setups, create it:
+
+```json
+{
+  "name": "my-worker",
+  "entrypoint": "index.js",
+  "compatibilityDate": "2024-09-23"
+}
+```
+
+### 8. Socket units persist — scaling won't re-create them
+
+Socket units at `/etc/systemd/system/workerd-<worker>-<port>.socket` are persistent. If a port is in the `ports` file but the socket unit was manually deleted, `workerd-scale set` won't re-create it. To fix, run:
+
+```bash
+workerd-scale start my-worker <port>
+```
+
+---
+
+## Diagnostic Commands Cheat Sheet
+
+```bash
+# Full system check
+echo "=== nginx ===" && systemctl is-active nginx && curl -s http://localhost/nginx_status | head -3
+echo "=== Workers ===" && for p in 8080 8081 8082 8083 8085; do curl -sf http://localhost:$p/healthz && echo " :$p OK" || echo " :$p FAIL"; done
+echo "=== LB Routes ===" && for w in hello hono-app fullstack vite-react; do curl -sf http://$w.localhost/ > /dev/null && echo " $w OK" || echo " $w FAIL"; done
+echo "=== nginx Config ===" && workerd-gen-nginx && nginx -t
 ```

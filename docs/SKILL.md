@@ -1,10 +1,14 @@
-# werkerd — Skill
+# werkerd — Complete Guide
 
 ## Overview
 
-`werkerd` is a self-hosted Cloudflare Workers runtime using the open-source `workerd` binary. It provides a CLI (`werkerd deploy`) that works like `wrangler deploy` — run it in any Cloudflare Workers project directory and it deploys to your own server. No Cloudflare account needed.
+`werkerd` is a self-hosted Cloudflare Workers runtime. It lets you deploy any Cloudflare Workers project to your own server using `workerd` — the real Cloudflare Workers runtime, open-sourced by Cloudflare.
 
 **Server**: `root@18.171.244.124` (Ubuntu 24.04)
+
+The goal is parity with Cloudflare Workers DX for self-hosted code. No Cloudflare account needed.
+
+---
 
 ## Quickstart
 
@@ -13,13 +17,13 @@
 cd werkerd-cli && npm install && npm link
 
 # 2. Deploy any Cloudflare Workers project
-cd ~/my-worker-project
+cd ~/my-worker
 werkerd deploy --port 8080
 
 # That's it. Zero config editing.
 ```
 
-The CLI reads `wrangler.jsonc` (or `wrangler.toml`) from your project, bundles with esbuild if needed, generates the Cap'n Proto config, uploads everything, and starts a systemd socket-activated service on the target port.
+---
 
 ## When to Use This Skill
 
@@ -27,64 +31,82 @@ Load this skill when:
 - Deploying a worker to `root@18.171.244.124`
 - Setting up service bindings, Durable Objects, KV, or WebSockets
 - Scaling a worker up/down across ports
-- Troubleshooting systemd, Caddy, or workerd config issues
-- Adding environment variables or secrets to workers
+- Troubleshooting systemd, nginx, or workerd issues
+- Adding environment variables or secrets
 - Setting up a new server from scratch
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│                  Internet                         │
-└─────────────────┬────────────────────────────────┘
-                  │ :80
-                  ▼
-┌──────────────────────────────────────────────────┐
-│  Caddy (reverse proxy)                            │
-│  /etc/caddy/Caddyfile                             │
-└─────────────┬────────────┬────────────────────────┘
-              │            │
-     localhost:8080  localhost:8081  (up to N ports)
-              │            │
-              ▼            ▼
-┌──────────────────────────────────────────────────┐
-│  systemd socket activation                       │
-│  workerd-<name>-<port>.socket → workerd@<name>:<port>
-└──────────────────────────────────────────────────┘
+                          Internet
+                             │
+                         nginx :80
+                        /   |   |   \
+              hello.    hono-app.  fullstack. vite-react.
+              localhost    localhost    localhost    localhost
+                             │        │        │
+              ┌─────────────┴────────┴────────┘
               │
-              ▼
-┌──────────────────────────────────────────────────┐
-│  workerd process (per instance)                   │
-│  /usr/bin/workerd serve config.<port>.capnp       │
-│  --socket-fd http=3                               │
-└──────────────────────────────────────────────────┘
+         systemd socket activation
+         workerd-hello-8080.socket → workerd@hello:8080.service
+         workerd-hello-8081.socket → workerd@hello:8081.service
               │
-              ▼
-┌──────────────────────────────────────────────────┐
-│  /etc/workerd/workers/<name>/                     │
-│    index.js              ← uploaded by CLI        │
-│    config.<port>.capnp   ← generated per port     │
-│    .env                  ← environment variables  │
-│    ports                 ← active port list        │
-└──────────────────────────────────────────────────┘
+         workerd processes
+         /usr/bin/workerd serve config.<port>.capnp --socket-fd http=3
+              │
+         /etc/workerd/workers/<name>/
+           index.js              ← uploaded by CLI
+           config.<port>.capnp   ← generated per port
+           .env                  ← environment variables
+           scale                 ← instance count (1, 2, 3...)
+           ports                  ← active port list
 ```
+
+### Component Layers
+
+**Layer 1: nginx** (reverse proxy)
+- Routes by hostname (`hello.localhost`, `hono-app.localhost`, etc.)
+- Load balances across multiple instances using `least_conn` algorithm
+- Provides `/nginx_status` monitoring endpoint
+- `proxy_next_upstream` handles failover automatically
+
+**Layer 2: systemd socket activation**
+- Listens on ports via socket units
+- Lazily spawns workerd processes on first request
+- Survives service restarts — no dropped connections
+
+**Layer 3: workerd runtime**
+- The actual Cloudflare Workers runtime
+- Runs JavaScript/WebAssembly workers
+- Supports all Cloudflare APIs: DO, KV, R2, WebSockets, etc.
+
+**Layer 4: Worker code**
+- ES Module format: `export default { fetch }`
+- Service Worker format: `addEventListener("fetch", ...)`
+- Access to `env.*` bindings
+
+---
 
 ## Project Format
 
-Any project with `wrangler.jsonc` works. Standard Cloudflare Workers project structure:
+Any project with `wrangler.jsonc` works. Standard Cloudflare Workers structure:
 
 ```
 my-project/
 ├── wrangler.jsonc       ← read by werkerd deploy
-├── package.json
+├── package.json          ← optional, for bundling
 ├── src/
 │   └── index.js         ← entrypoint
-└── .env                 ← optional, copied to server for secrets
+└── .env                 ← optional, secrets
 ```
 
-### wrangler.jsonc
+---
 
-The CLI reads standard Cloudflare `wrangler.jsonc` fields:
+## wrangler.jsonc Reference
+
+`werkerd deploy` reads standard Cloudflare `wrangler.jsonc` fields. Same format as `wrangler deploy` — no config changes needed.
 
 ```jsonc
 {
@@ -92,7 +114,7 @@ The CLI reads standard Cloudflare `wrangler.jsonc` fields:
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
 
-  // Text bindings (available as env.VAR_NAME)
+  // Text bindings — static strings embedded in config
   "vars": {
     "GREETING": "Hello!",
     "APP_ENV": "production"
@@ -121,7 +143,7 @@ The CLI reads standard Cloudflare `wrangler.jsonc` fields:
     ]
   },
 
-  // Service bindings (call other workers)
+  // Service bindings — call other workers in same process
   "services": [
     { "binding": "AUTH", "service": "auth-worker" }
   ],
@@ -135,6 +157,20 @@ The CLI reads standard Cloudflare `wrangler.jsonc` fields:
 }
 ```
 
+### wrangler.jsonc → Cap'n Proto Mapping
+
+| wrangler.jsonc field | Cap'n Proto | Purpose |
+|---------------------|-----------|---------|
+| `vars` | `text = "..."` | Static string values |
+| `kv_namespaces` | `kvNamespace = "..."` | KV storage binding |
+| `r2_buckets` | `r2Bucket = "..."` | Object storage binding |
+| `d1_databases` | wrapped binding | SQLite database |
+| `durable_objects.bindings` | `durableObjectNamespace = ...` | DO binding |
+| `services` | `service = "..."` | Service binding (in-process call) |
+| `queues.producers` | `queue = "..."` | Message queue |
+
+---
+
 ## CLI Commands
 
 ### werkerd deploy
@@ -144,19 +180,26 @@ werkerd deploy [--port <port>]
 ```
 
 What it does:
-1. Reads `wrangler.jsonc` from current directory2. Auto-bundles with esbuild if the project has npm dependencies3. Generates Cap'n Proto config for workerd4. Copies `.env` from project (if exists) for secrets5. Uploads everything to the server via SCP6. Creates systemd socket unit and starts the service7. Health-checks the endpoint
+1. Reads `wrangler.jsonc` from current directory
+2. Auto-detects npm dependencies
+3. Bundles with esbuild if needed (`import` statements, Hono, etc.)
+4. Generates Cap'n Proto config for workerd
+5. Copies `.env` from project (if exists) for secrets
+6. Uploads everything to server via SCP
+7. Creates systemd socket unit and starts the service
+8. Regenerates nginx config and reloads nginx
+9. Health-checks the endpoint
 
 ```bash
-# Deploy to default port (8080)
+# Deploy to default port 8080
 werkerd deploy
 
-# Deploy to a specific port
+# Deploy to specific port
 werkerd deploy --port 3000
-```
 
-The server defaults to `root@18.171.244.124`. Override with:
-```bash
+# Override server
 export WERKERD_SERVER=root@my-server.com
+werkerd deploy --port 8080
 ```
 
 ### werkerd whoami
@@ -167,117 +210,183 @@ werkerd whoami
 
 Shows the current server and deployed workers.
 
+---
+
 ## Server Management
 
-### Scale workers
+### workerd-scale
+
+Git-driven scaling CLI.
 
 ```bash
-# On the server
-workerd-scale up <name> <port>      # Add an instance
-workerd-scale down <name> <port>     # Remove an instance
-workerd-scale list <name>           # Show all ports
+# Show CPU cores and scaling advice
+ssh root@18.171.244.124 workerd-scale info
+
+# Set instance count (git-driven workflow)
+# 1. Edit /etc/workerd/workers/<worker>/scale locally
+# 2. Push to server
+# 3. Server applies: workerd-scale set <worker> <N>
+workerd-scale set <worker> <N>
+
+# Start a new worker
+workerd-scale start <worker> <port>
+
+# Stop all instances
+workerd-scale stop <worker>
+
+# Show status
+workerd-scale list <worker>
 ```
+
+**Git-driven scaling workflow**:
+```bash
+# Locally: edit the scale file
+echo 2 > /etc/workerd/workers/hello/scale
+git add -A && git commit && git push
+
+# On server (via post-receive hook or manual):
+workerd-scale set hello 2
+```
+
+**Scaling advice**:
+- 1 core: scaling won't help — deploy to more cores
+- 2 cores: marginal benefit (context switching)
+- 4+ cores: scaling works linearly — set instances = cores
 
 ### View logs
 
 ```bash
-# Specific worker
-journalctl -u workerd@my-worker:8080 -f
-
 # All workerd services
 journalctl -u 'workerd@*' -f
 
-# Caddy logs
-journalctl -u caddy -f
+# Specific worker (all instances)
+journalctl -u 'workerd@hello:*' -f
+
+# Single instance
+journalctl -u 'workerd@hello:8080.service' -n 50
+
+# nginx access logs
+tail -f /var/log/nginx/workerd-access.log
+
+# nginx error logs
+tail -f /var/log/nginx/workerd-error.log
 ```
 
 ### System status
 
 ```bash
 # Active services
-systemctl list-units 'workerd@*' --no-legend
+systemctl list-units 'workerd@*' --no-legend --state=active
 
-# Port usage
+# All sockets
+systemctl list-units 'workerd-*-*.socket' --no-legend
+
+# Listening ports
 ss -tlnp | grep workerd
 
-# All active ports
-cat /etc/workerd/workers/*/ports
+# nginx status (monitoring)
+curl http://localhost/nginx_status
+
+# Active connections breakdown
+ss -s
 ```
+
+---
 
 ## Examples
 
 All examples are standard npm projects. Deploy with `werkerd deploy`:
 
 ### Hello World
-`examples/hello/` — Minimal worker with text binding
 ```bash
 cd examples/hello
-werkerd deploy --port 8084
-curl http://18.171.244.124:8084/
+werkerd deploy --port 8080
+curl http://hello.localhost/
+curl http://18.171.244.124:8080/
 ```
 
-### Hono Framework (first-class)
-`examples/hono-app/` — Full Hono app with routing, JSON, HTML
+### Hono Framework
 ```bash
 cd examples/hono-app
 npm install
 werkerd deploy --port 8082
-curl http://18.171.244.124:8082/
+curl http://hono-app.localhost/
+curl http://hono-app.localhost/hello/world
+curl -X POST http://hono-app.localhost/echo -d '{"msg":"hi"}'
 ```
 
-### Vite + React SSR (first-class)
-`examples/vite-react/` — Vite React app with SSR on workerd
+### Vite + React SSR
 ```bash
 cd examples/vite-react
 npm install
 werkerd deploy --port 8083
-curl http://18.171.244.124:8083/
+curl http://vite-react.localhost/api/info
 ```
 
-### Durable Objects + WebSockets
-`examples/fullstack/` — DO Counter, WebSocket ChatRoom, env vars
+### Fullstack (DO + WebSockets + Env Vars)
 ```bash
 cd examples/fullstack
 werkerd deploy --port 8085
-curl http://18.171.244.124:8085/diag
+curl http://fullstack.localhost/diag
+curl -X POST http://localhost:8085/counter/increment
+curl http://localhost:8085/kv/testkey?value=hello
 ```
 
-### Service Bindings
-`examples/api/` — API worker calling auth worker via `env.AUTH.fetch()`
-```bash
-# On server: workerd-scale up api 8090
-curl http://18.171.244.124:8090/diag
-```
+---
 
 ## Environment Variables & Secrets
 
-### Text bindings (in wrangler.jsonc)
-For non-sensitive config values:
-```jsonc
-{ "vars": { "GREETING": "Hello!" } }
-```
-Values are embedded in the Cap'n Proto config. Available as `env.GREETING`.
+### .env file (recommended for secrets)
 
-### Secrets (.env file)
-For sensitive values, create a `.env` file in your project:
+Create a `.env` file in your project:
+
 ```bash
-# .env
 SECRET_KEY=sk-abc123
 DATABASE_URL=postgres://...
+DEBUG=false
 ```
-The CLI copies this to the server. The `workerd-start` script sources it before launching workerd. Available via `fromEnvironment` binding in the config.
+
+The CLI copies this to the server at `/etc/workerd/workers/<name>/.env`. The `workerd-start` script sources it before launching workerd.
+
+Access in worker code:
+```javascript
+export default {
+  fetch(request, env) {
+    const key = env.SECRET_KEY;  // "sk-abc123"
+    const db = env.DATABASE_URL; // "postgres://..."
+  }
+};
+```
+
+### Text bindings (wrangler.jsonc vars)
+
+For non-secret config values, use `vars` in wrangler.jsonc:
+
+```jsonc
+"vars": {
+  "GREETING": "Hello!",
+  "APP_ENV": "production"
+}
+```
+
+Values are embedded directly in the Cap'n Proto config. Available as `env.GREETING`.
+
+---
 
 ## Binding Types
 
-| Type | wrangler key | Cap'n Proto | Purpose |
-|------|-------------|-------------|---------|
-| Text | `vars` | `(name = "X", text = "Y")` | Static string values |
-| Service | `services` | `(name = "X", service = "Y")` | Call another worker |
-| Durable Object | `durable_objects.bindings` | `(name = "X", durableObjectNamespace = ...)` | DO access |
-| KV namespace | `kv_namespaces` | `(name = "X", kvNamespace = ...)` | KV storage |
-| R2 bucket | `r2_buckets` | `(name = "X", r2Bucket = ...)` | Object storage |
-| D1 database | `d1_databases` | Wrapped binding | SQLite database |
-| Queue | `queues.producers` | `(name = "X", queue = ...)` | Message queues |
+| Type | wrangler.jsonc | Cap'n Proto | Worker Access |
+|------|---------------|-------------|--------------|
+| Text | `vars` | `text = "..."` | `env.VAR` |
+| Service | `services` | `service = "name"` | `env.BINDING.fetch()` |
+| Durable Object | `durable_objects` | `durableObjectNamespace = (...)` | `env.BINDING.idFromName()` |
+| KV | `kv_namespaces` | `kvNamespace = "..."` | `env.BINDING.get()/put()` |
+| R2 | `r2_buckets` | `r2Bucket = "..."` | `env.BINDING.get()` |
+| Queue | `queues.producers` | `queue = "..."` | `env.BINDING.send()` |
+| D1 | `d1_databases` | wrapped | `env.BINDING.prepare()` |
+| Env var | `.env` file | `fromEnvironment = "NAME"` | `env.NAME` |
+
+---
 
 ## File System Layout (Server)
 
@@ -285,165 +394,210 @@ The CLI copies this to the server. The `workerd-start` script sources it before 
 /etc/workerd/
   workers/
     <name>/
-      index.js              ← Uploaded by CLI
-      config.<port>.capnp   ← Generated per port
-      .env                  ← Secrets (copied from project)
-      ports                 ← Active port list (one per line)
+      index.js              ← uploaded by CLI (or git hook)
+      config.<port>.capnp   ← generated per port+instance
+      .env                  ← secrets (copied by CLI)
+      scale                 ← instance count (1, 2, 3...)
+      ports                 ← active port list
 
 /var/git/
-  <name>.git/               ← Bare git repo for deploy (optional legacy)
+  <name>.git/              ← bare git repo for git-push deploy
 
 /usr/local/bin/
-  workerd-gen-config        ← Config generator (legacy manifest.json mode)
-  workerd-start             ← systemd ExecStart wrapper
-  workerd-scale             ← Scale manager
-  workerd-gen-caddyfile     ← Caddyfile generator
+  workerd-scale             ← scaling CLI
+  workerd-gen-nginx        ← nginx config generator
+  workerd-gen-config       ← Cap'n Proto config generator
+  workerd-start            ← systemd ExecStart wrapper
 
 /etc/systemd/system/
-  workerd@.service          ← Template service unit
-  workerd-<name>-<port>.socket  ← Per-instance socket unit
+  workerd@.service         ← template service unit
+  workerd-<name>-<port>.socket  ← per-instance socket unit
 
-/etc/caddy/
-  Caddyfile                 ← Auto-generated + manual
-  Caddyfile.manual          ← User overrides
+/etc/nginx/
+  sites-available/workerd  ← auto-generated per-worker upstreams
+  sites-enabled/workerd
 ```
 
-## Troubleshooting
-
-### Service fails to start
-```bash
-systemctl status workerd@my-worker:8080
-journalctl -u workerd@my-worker:8080 -n 50
-```
-
-Common causes:
-- **Config validation error**: `workerd compile config.8080.capnp`
-- **Missing embed file**: Ensure `index.js` exists, path is relative to config
-- **Port in use**: `ss -tlnp | grep <port>`
-- **Binding mismatch**: Binding names in wrangler.jsonc must match worker code
-
-### Socket activation not triggering
-```bash
-systemctl status workerd-my-worker-8080.socket
-ss -tlnp | grep <port>  # should show systemd listening
-```
-
-### Reset a broken service
-```bash
-systemctl stop workerd-my-worker-8080.socket
-systemctl reset-failed workerd@my-worker:8080.service
-# Redeploy or restart
-```
+---
 
 ## Bootstrap (New Server)
 
 ```bash
-# 1. Copy scripts
-scp management-scripts/* root@<host>:/tmp/werkerd-scripts/
+# 1. On your local machine: copy scripts to server
+scp -r management-scripts/* root@<new-server>:/tmp/werkerd-scripts/
 
-# 2. Run bootstrap
-ssh root@<host> bash /tmp/werkerd-scripts/bootstrap.sh
+# 2. On server: run bootstrap as root
+ssh root@<new-server>
+bash /tmp/werkerd-scripts/bootstrap.sh
 
-# 3. Install the CLI on your machine
+# 3. On your local machine: install CLI
 cd werkerd-cli && npm install && npm link
 
 # 4. Deploy!
 cd examples/hello && werkerd deploy --port 8080
 ```
 
+The bootstrap script:
+- Installs Node.js 20.x
+- Installs workerd globally
+- Installs and configures nginx
+- Creates the `workerd` system user
+- Creates all required directories
+- Installs management scripts to `/usr/local/bin/`
+- Installs systemd service units
+- Creates the `deploy` user for git-push deployments
+- Enables nginx
+
+---
+
+## Troubleshooting
+
+### Service fails to start
+
+```bash
+# Check status
+systemctl status workerd@hello:8080.service
+
+# Check logs
+journalctl -u workerd@hello:8080.service -n 50 --no-pager
+
+# Common errors:
+# "No such file: config.8080.capnp" → run: workerd-gen-config hello 8080
+# "embed path not found" → worker file missing or wrong path
+# "ES module parse error" → use service worker format or set moduleType
+```
+
+### nginx not proxying
+
+```bash
+# Check nginx is running
+systemctl status nginx
+
+# Test config
+nginx -t
+
+# Reload
+systemctl reload nginx
+
+# Check access
+curl http://hello.localhost/
+
+# Direct vs nginx
+curl http://localhost:8080/      # should work (direct)
+curl http://hello.localhost/     # should work (via nginx)
+```
+
+### Socket activation not triggering
+
+```bash
+# Check socket is listening
+systemctl status workerd-hello-8080.socket
+ss -tlnp | grep :8080  # should show systemd listening
+
+# Trigger manually
+curl http://localhost:8080/
+
+# If still not working, check the socket unit file
+cat /etc/systemd/system/workerd-hello-8080.socket
+```
+
+### Scale not taking effect
+
+```bash
+# Check scale file
+cat /etc/workerd/workers/hello/scale
+
+# Check running instances
+workerd-scale list hello
+
+# Apply manually
+workerd-scale set hello 2
+```
+
+---
+
 ## Supported Features
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ES Modules | Supported | `export default { fetch }` |
-| Service Workers | Supported | `addEventListener("fetch", ...)` |
-| Hono | First-class | Full Hono framework support |
-| Vite + React SSR | First-class | Build + deploy workflow |
-| SvelteKit SSR | Supported | Build output as ES module |
-| Service Bindings | Supported | `env.NAME.fetch()` |
-| Durable Objects | Supported | Per-worker namespace, in-memory storage |
-| WebSockets | Supported | `new WebSocketPair()` |
-| Environment Variables | Supported | `.env` file + text bindings |
-| KV Namespaces | Supported | Requires backend service |
-| R2 Buckets | Supported | Requires backend service |
-| Zero-downtime Deploy | Supported | Rolling restart via systemd |
-| Socket Activation | Supported | systemd socket units |
-| Caddy LB | Supported | Health-checked reverse proxy |
-| Scale Up/Down | Supported | `workerd-scale` CLI |
-| esbuild bundling | Supported | Auto-detects npm deps |
+| ES Modules | ✅ | `export default { fetch }` |
+| Service Workers | ✅ | `addEventListener("fetch", ...)` |
+| Hono | ✅ First-class | Full Hono framework |
+| Vite + React SSR | ✅ First-class | Build + deploy |
+| SvelteKit SSR | ✅ | Build output as ES module |
+| Service Bindings | ✅ | `env.NAME.fetch()` in same process |
+| Durable Objects | ✅ | In-memory (localDisk optional) |
+| WebSockets | ✅ | `new WebSocketPair()` |
+| Environment Variables | ✅ | `.env` file + text bindings |
+| KV Namespaces | ✅ | Requires backend (or in-memory stub) |
+| R2 Buckets | ✅ | Requires backend (or stub) |
+| D1 Databases | ✅ | Requires backend |
+| Zero-downtime Deploy | ✅ | Rolling restart via systemd |
+| Socket Activation | ✅ | systemd socket units |
+| nginx LB | ✅ | hostname routing + load balancing |
+| Git-driven Scaling | ✅ | `workerd-scale set <N>` |
+| esbuild bundling | ✅ | Auto-detects npm deps |
+
+---
 
 ## Known Limitations
 
-1. **KV, R2, D1 require backend services**: These bindings point to a service name. You need to configure the corresponding backend (or use in-memory stubs). The binding itself works — the backend is what you wire up.
+1. **KV, R2, D1 require a backend**: The binding works but needs a service to back it. For local dev, use in-memory stubs.
 
-2. **DO storage is in-memory**: Durable Object state persists only for the process lifetime. For production, configure `localDisk` or an external storage backend.
+2. **DO storage is in-memory by default**: State survives restarts within the process lifetime. Configure `localDisk` for persistence.
 
-3. **No Cloudflare Dashboard**: Purely self-hosted. No UI for managing deployments.
+3. **Scaling only helps with more CPU cores**: workerd is single-threaded. On a 2-core VM, 2 instances compete for the same cores. On 4+ cores, scaling is linear.
 
-4. **Single binary per instance**: Each systemd instance runs one workerd process. Group workers share the same process isolate.
+4. **No multi-server replication**: Durable Objects are local to one server. For HA, run multiple servers with a load balancer in front.
 
-5. **No cross-server replication**: Durable Objects stored locally. No automatic replication across servers.
+5. **`werkerd deploy` creates `manifest.json` automatically**: The CLI now writes `manifest.json` to the server after deploy, so `workerd-scale set/start` works immediately without manual setup.
 
-6. **Caddy reload may drop connections**: Use `caddy reload --config` gracefully. For zero-downtime changes, the connection pooling settings below minimize impact.
+6. **`workerd-scale set` skips existing socket units**: Socket units are now only created if they don't exist, so scaling won't interrupt running instances.
+
+---
 
 ## Performance
 
-### Load Test Results (2-core VM, Ubuntu 24.04)
+**Load test results** (2-core VM, Ubuntu 24.04):
 
-| Configuration | RPS | p50 | p99 | Overhead |
-|---|---|---|---|---|
-| Direct workerd (1 instance) | **8,873** | 5.5ms | — | baseline |
-| Caddy LB :80 → 5 instances (optimized) | **4,425** | 43ms | 114ms | 2.0x |
-| Caddy LB :80 → 5 instances (unoptimized) | 2,893 | 52ms | 757ms | 3.1x |
-| Hono framework (1 instance) | **926** | 65ms | 476ms | — |
-| Fullstack (DO + WS, 1 instance) | **3,508** | 1.5ms | 269ms | — |
-| External (London ← US, ~250ms RTT) | ~340 | 250ms | 878ms | network-bound |
+| Configuration | RPS | p50 | p99 |
+|---|---|---|---|
+| Direct workerd (1 instance, localhost) | 8,957 | 13ms | 93ms |
+| nginx LB (1 backend) | 8,118 | 21ms | 143ms |
+| nginx LB (2 backends) | 8,327 | 20ms | 171ms |
+| Hono app via nginx | 2,575 | 15ms | 35ms |
+| Fullstack DO via nginx | 6,846 | 26ms | 1.04s |
 
-**Per-core throughput**: ~4,550 RPS/core for simple workers, ~475 RPS/core for Hono framework.
+**Per-core throughput**: ~4,500-8,900 RPS depending on workload.
 
-**Linear scaling confirmed**: 2 instances = 2x throughput (within CPU bounds). 6 concurrent instances on 2 cores delivered 9,184 combined RPS.
+**Linear scaling confirmed** on multi-core machines (4+ cores).
 
-**To reach 1M RPS**: ~220 cores direct, ~440 cores behind Caddy. Achievable with horizontal scaling across ~55-110 VMs of this size behind a global load balancer.
+**To reach 1M RPS**: ~120 cores at ~8,000 RPS/core behind nginx.
 
-### Caddy Performance Tuning
+---
 
-The `workerd-gen-caddyfile` script applies these optimizations automatically:
+## nginx Configuration
 
-```caddyfile
-{
-    admin localhost:2019
-    log {
-        level WARN          # Reduce disk I/O
-    }
-}
+Generated by `workerd-gen-nginx`, applied automatically on deploy/scale.
 
-worker.yourdomain.com {
-    reverse_proxy localhost:8080 localhost:8081 {
-        lb_policy least_conn
-        transport http {
-            max_conns_per_host    200      # Prevent connection exhaustion
-            keepalive             30s      # TCP connection reuse (biggest win)
-            keepalive_idle_conns  100      # Warm connection pool
-            dial_timeout          5s       # Fast fail on dead backends
-            response_header_timeout 30s    # Prevent slow backend blocking
-        }
-    }
-}
+Key settings:
+- `least_conn` — distributes load evenly
+- `keepalive 100` — upstream connection pool
+- `zone workerd_<worker>_upstream 64k` — shared memory for LB state
+- `proxy_next_upstream error timeout http_502 http_503 http_504` — failover
+
+Monitoring:
+```bash
+curl http://localhost/nginx_status
 ```
 
-Results: **+53% throughput (2,893 → 4,425 RPS), -85% p99 latency (757ms → 114ms)**.
-
-**Monitoring**:
-```bash
-# Caddy metrics
-curl http://localhost:2019/metrics
-
-# Active connections
-ss -s
-
-# File descriptor usage
-ls /proc/$(pgrep caddy)/fd | wc -l
-
-# Health status
-curl -s http://localhost:2019/metrics | grep upstreams_healthy
+Example upstream:
+```nginx
+upstream workerd_hello {
+    zone workerd_hello_upstream 64k;
+    least_conn;
+    keepalive 100;
+    server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:8081 max_fails=3 fail_timeout=10s;
+}
 ```

@@ -72,6 +72,19 @@ export async function deploy({ port }) {
   console.log("  → Uploading...");
   execSync(`ssh ${SERVER} "mkdir -p ${remoteDir}"`, { stdio: "pipe" });
   execSync(`scp -r ${tmpDir}/* ${SERVER}:${remoteDir}/`, { stdio: "pipe" });
+
+  // Create manifest.json for workerd-gen-config (needed for scaling)
+  const manifest = {
+    name: project.name,
+    entrypoint: entryName,
+    compatibilityDate: project.compatibilityDate,
+    moduleType: "esm",
+  };
+  execSync(
+    `ssh ${SERVER} "cat > ${remoteDir}/manifest.json << 'MANIFESTEOF'\n${JSON.stringify(manifest, null, 2)}\nMANIFESTEOF"`,
+    { stdio: "pipe" }
+  );
+
   fs.rmSync(tmpDir, { recursive: true, force: true });
   try { fs.unlinkSync("/tmp/werkerd-bundle.js"); } catch {}
 
@@ -108,8 +121,8 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now "$SOCK_UNIT"
-/usr/local/bin/workerd-gen-caddyfile 2>/dev/null || true
-caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+/usr/local/bin/workerd-gen-nginx 2>/dev/null || true
+nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 echo "OK"
 `;
 
@@ -117,7 +130,7 @@ echo "OK"
   fs.writeFileSync(rsPath, remoteScript);
   execSync(`scp ${rsPath} ${SERVER}:${rsPath}`, { stdio: "pipe" });
   execSync(`ssh ${SERVER} "bash ${rsPath}"`, { encoding: "utf8", timeout: 30000 });
-  fs.unlinkSync(rsPath);
+  try { fs.unlinkSync(rsPath); } catch {}
 
   // Step 5: Health check
   console.log("  → Health check...");

@@ -2,36 +2,35 @@
 
 ## Overview
 
-WERKERD is a self-hosted Cloudflare Workers runtime built on `workerd` (Cloudflare's open-source Workers runtime), managed by systemd socket activation, fronted by Caddy for SSL and load balancing, and deployed via git push.
+WERKERD is a self-hosted Cloudflare Workers runtime built on `workerd` (Cloudflare's open-source Workers runtime), managed by systemd socket activation, fronted by nginx for load balancing, and deployed via git push or the `werkerd deploy` CLI.
 
 ```
-                         Internet
-                            |
-                        [Caddy :80]
-                       /      |      \
-                 localhost   localhost  localhost
-                    :8080     :8081     :8090
-                      |         |         |
-                 [systemd socket units]   |
-                      |         |         |
-                 [workerd @ hello:8080]   |
-                 [workerd @ hello:8081]   |
-                                          |
-                                   [workerd @ api:8090]
-                                    /                    \
-                              [api worker]           [auth worker]
-                              env vars               service binding
-                              ES modules             token validation
+                          Internet
+                             |
+                         [nginx :80]
+                        /      |      \
+             hello.localhost hono-app.localhost fullstack.localhost
+                             |         |         |
+                  [systemd socket units]    |
+                       |         |         |
+              [workerd @ hello:8080]   |
+              [workerd @ hello:8081]   |
+                                       |
+                                [workerd @ fullstack:8085]
+                                 /                    \
+                      [fullstack worker]    [Durable Objects]
+                      env vars               in-memory storage
 ```
 
 ## Component Layers
 
-### Layer 1: Edge Proxy (Caddy)
+### Layer 1: Edge Proxy (nginx)
 
-- Terminates TLS
-- Health-checks worker instances
-- Load balances across instances
-- Provides access logging
+- Terminates HTTP (TLS handled separately or at cloud edge)
+- Health-checks worker instances via /healthz
+- Load balances across instances using `least_conn` algorithm
+- Provides access logging with custom format
+- Routes by hostname (`hello.localhost`, etc.)
 
 ### Layer 2: Systemd Socket Activation
 
@@ -57,75 +56,96 @@ WERKERD is a self-hosted Cloudflare Workers runtime built on `workerd` (Cloudfla
 ```
 /etc/workerd/
   workers/
-    hello/                     ← Worker "hello"
-      worker.js                ← Entrypoint source
-      manifest.json            ← Worker metadata
-      .env                     ← Environment variables
-      config.8080.capnp        ← Generated per-port config
-      config.8081.capnp        ← (multiple ports = multiple configs)
-      ports                    ← Active port list (one per line)
-    api/                       ← Worker "api" (group leader)
-      worker.js
-      manifest.json
+    hello/
+      index.js              ← uploaded by CLI (or git hook)
+      config.8080.capnp     ← generated per port
+      config.8081.capnp     ← (multiple ports = multiple configs)
+      .env                  ← environment variables
+      scale                 ← desired instance count (1, 2, 3...)
+      ports                 ← active port list (one per line)
+    api/
+      index.js
+      manifest.json         ← needed for workerd-gen-config
       .env
       config.8090.capnp
       ports
-      group-auth.js            ← Copied group member
-    auth/                      ← Worker "auth" (group member)
-      worker.js                ← Deployed by api's post-receive hook
+      group-auth.js         ← copied group member
 
 /var/git/
-  hello.git/                   ← Bare git repo for worker "hello"
-    hooks/post-receive         ← Deploy hook
-  api.git/                     ← Bare git repo for worker "api"
+  hello.git/               ← bare git repo for worker "hello"
+    hooks/post-receive      ← deploy hook
+  api.git/
 
-/var/lib/workerd/              ← State (KV, DO storage, etc.)
+/var/lib/workerd/          ← state (KV, DO storage, etc.)
+
 /usr/local/bin/
-  workerd-gen-config           ← Config generator
-  workerd-start                ← systemd ExecStart wrapper
-  workerd-scale                ← Scale up/down/list
-  workerd-gen-caddyfile        ← Caddyfile generator
-  workerd-deploy               ← Manual deploy script
+  workerd-gen-config        ← Cap'n Proto config generator
+  workerd-start            ← systemd ExecStart wrapper
+  workerd-scale            ← scaling CLI
+  workerd-gen-nginx        ← nginx config generator
 
 /etc/systemd/system/
-  workerd@.service             ← Template service unit
-  workerd-hello-8080.socket    ← Per-instance socket unit
+  workerd@.service         ← template service unit
+  workerd-hello-8080.socket ← per-instance socket unit
   workerd-hello-8081.socket
-  workerd-api-8090.socket
 
-/etc/caddy/
-  Caddyfile                    ← Generated Caddy config
-  Caddyfile.manual             ← Manual Caddy entries (merged)
+/etc/nginx/
+  sites-available/workerd  ← auto-generated per-worker upstreams
+  sites-enabled/workerd
+```
+
+## nginx Load Balancer Configuration
+
+Generated by `workerd-gen-nginx`, applied automatically on deploy/scale.
+
+Key settings:
+- `least_conn` — distributes load to the backend with the fewest active connections
+- `keepalive 100` — upstream connection pool (reuses TCP connections)
+- `zone workerd_<worker>_upstream 64k` — shared memory for load balancing state
+- `proxy_next_upstream error timeout http_502 http_503 http_504` — automatic failover
+- `proxy_connect_timeout 5s` — fail fast on dead backends
+- `proxy_read_timeout 30s` — slow backend guard
+
+Example upstream:
+```nginx
+upstream workerd_hello {
+    zone workerd_hello_upstream 64k;
+    least_conn;
+    keepalive 100;
+    server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:8081 max_fails=3 fail_timeout=10s;
+}
+```
+
+Monitoring:
+```bash
+curl http://localhost/nginx_status
 ```
 
 ## Configuration Flow
 
 ```
-manifest.json ──→ workerd-gen-config ──→ config.<port>.capnp ──→ workerd serve
-    │                     │                                            │
-    │                     ├── group members ──────────────────────────┘
-    │                     │   (copied as group-{name}.js)
-    │                     │
-    │                     ├── env vars (.env) ────────────────────────┘
-    │                     │
-    │                     └── bindings ──────────────────────────────┘
-    │
-    └── manifest schema:
-        {
-          "name": "worker-name",
-          "compatibilityDate": "2024-09-23",
-          "entrypoint": "worker.js",
-          "group": ["leader", "member1", "member2"],
-          "bindings": [
-            { "name": "AUTH", "service": "auth" },
-            { "name": "KV", "kvNamespace": "cache" },
-            { "name": "BUCKET", "r2Bucket": "assets" }
-          ],
-          "env": ["SECRET_KEY", "API_URL"]
-        }
+wrangler.jsonc ──→ werkerd deploy ──→ config.<port>.capnp ──→ workerd serve
+     │                    │                                      │
+     │                    ├── .env (copied) ─────────────────────┘
+     │                    ├── bindings (Cap'n Proto) ────────────┘
+     │                    │
+     │                    └── esbuild bundle (if npm deps)
 ```
 
-## Deploy Flow
+### wrangler.jsonc → Cap'n Proto Mapping
+
+| wrangler.jsonc field | Cap'n Proto | Purpose |
+|---------------------|-----------|---------|
+| `vars` | `text = "..."` | Static string values |
+| `kv_namespaces` | `kvNamespace = (service = "...")` | KV storage binding |
+| `r2_buckets` | `r2Bucket = "..."` | Object storage binding |
+| `d1_databases` | wrapped binding | SQLite database |
+| `durable_objects.bindings` | `durableObjectNamespace = (className = "...")` | DO binding |
+| `services` | `service = "..."` | Service binding (in-process call) |
+| `queues.producers` | `queue = "..."` | Message queue |
+
+## Deploy Flow (Git Push)
 
 ```
 git push deploy main
@@ -133,24 +153,27 @@ git push deploy main
      ▼
 post-receive hook
      │
-     ├── Check out worker.js
-     ├── Sync group members (auth-worker.js, etc.)
+     ├── Checkout worker.js to /etc/workerd/workers/<name>/
      ├── Regenerate config for each port
-     │      └── workerd-gen-config <worker> <port>
-     ├── Rolling restart
-     │      └── systemctl restart workerd@<worker>:<port> (one at a time)
-     └── Done (responds to git push)
+     │      └── workerd-gen-config <name> <port>
+     ├── Regenerate nginx config
+     │      └── workerd-gen-nginx && systemctl reload nginx
+     └── Rolling restart (zero downtime)
+            └── systemctl restart workerd@<name>:<port> (one at a time, 0.5s gap)
 ```
 
 ## Network Flow
 
 ```
-Browser ──HTTPS──▶ Caddy (:443) ──HTTP──▶ workerd (:8080) ──▶ Worker code
-                                        └──▶ workerd (:8081) ──▶ Worker code
+Browser ──HTTP──▶ nginx (:80) ──HTTP──▶ workerd (:8080) ──▶ Worker code
+                                        └───HTTP──▶ workerd (:8081) ──▶ Worker code
 
 Health checks:
-Caddy ──GET /healthz──▶ workerd (:8080) ──▶ 200 OK
-Caddy ──GET /healthz──▶ workerd (:8081) ──▶ 200 OK
+nginx ──GET /healthz──▶ workerd (:8080) ──▶ 200 OK
+nginx ──GET /healthz──▶ workerd (:8081) ──▶ 200 OK
+
+Load balancing (least_conn):
+nginx tracks active connections per upstream and routes to the least busy.
 ```
 
 ## Service Binding Flow
@@ -167,49 +190,7 @@ Caddy ──GET /healthz──▶ workerd (:8081) ──▶ 200 OK
   └──────────────────────────────────────────┘
 ```
 
-Service bindings use in-process HTTP — no network overhead.
-
-## Caddy LB Performance Layer
-
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │  Caddy (:80, :443)                                        │
-  │                                                           │
-  │  ┌─────────────────────────────────────────────────────┐ │
-  │  │  Transport tuning (auto-applied by generator)        │ │
-  │  │                                                      │ │
-  │  │  max_conns_per_host 200   ← Prevents exhaustion     │ │
-  │  │  keepalive 30s            ← TCP reuse (biggest win)  │ │
-  │  │  keepalive_idle_conns 100 ← Warm connection pool    │ │
-  │  │  dial_timeout 5s          ← Fast dead-backend fail  │ │
-  │  │  response_header_timeout 30s ← Slow backend guard  │ │
-  │  │                                                      │ │
-  │  │  lb_policy least_conn     ← Even load distribution  │ │
-  │  │  health_uri /healthz      ← 10s interval, 3s timeout│ │
-  │  └─────────────────────────────────────────────────────┘ │
-  │                                                           │
-  │  Admin API :2019 → /metrics for Prometheus/Grafana      │
-  │  Log level WARN → reduced disk I/O                       │
-  └──────────────────────────────────────────────────────────┘
-       │                    │                     │
-  localhost:8080      localhost:8081      localhost:8086
-       │                    │                     │
-  [workerd]            [workerd]            [workerd]
-  (4,550 RPS/core)    (4,550 RPS/core)    (4,550 RPS/core)
-```
-
-### Performance Characteristics
-
-| Metric | Direct workerd | Via Caddy LB | Overhead |
-|---|---|---|---|
-| Throughput (1 instance) | 8,873 RPS | 4,425 RPS | 2.0x |
-| p50 latency | 5.5ms | 43ms | 7.8x |
-| p99 latency | — | 114ms | — |
-| Per-core ceiling | 4,550 RPS | ~2,250 RPS | 2.0x |
-
-**Overhead breakdown**: ~40% Go runtime overhead, ~30% connection proxying, ~30% health checks and logging. Each hop through the LB doubles latency but enables horizontal scaling, TLS termination, and health-checked failover.
-
-**Scaling to 1M RPS**: ~440 cores behind Caddy (or ~220 cores with direct workerd + a lower-overhead LB like haproxy/nginx). Horizontal scaling is unlimited — add more instances via `workerd-scale up`.
+Service bindings use in-process HTTP — no network overhead, no extra latency.
 
 ## Durable Objects Flow
 
@@ -222,10 +203,35 @@ Service bindings use in-process HTTP — no network overhead.
   │  │          │◀──────────────              │   • idFromName("global")
   │  └──────────┘   Response                  │   • getCounterValue()
   │                                           │   • increment(amount)
-  │  ┌──────────┐  ctx.env.CHATROOM           │   • SQLite-backed storage
+  │  ┌──────────┐  ctx.env.CHATROOM           │   • in-memory storage
   │  │ worker   │ ───────────────────▶ [DO Stub] ──▶ ChatRoom DO instance
-  │  └──────────┘                                │   • idFromName("room1")
-  │                                              │   • getMessages()
-  │                                              │   • addMessage()
-  └──────────────────────────────────────────────┘
+  │  └──────────┘                             │   • idFromName("room1")
+  └───────────────────────────────────────────┘
 ```
+
+DO classes must be exported from the **same module** that exports `default`.
+
+## Performance Characteristics
+
+| Metric | Direct workerd | Via nginx LB | Overhead |
+|--------|---------------|--------------|---------|
+| Throughput (1 instance) | 8,957 RPS | 8,118 RPS | ~9% |
+| p50 latency | 13ms | 21ms | ~54% |
+| p99 latency | 93ms | 143ms | ~54% |
+| Per-core ceiling | ~9,000 RPS | ~8,000 RPS | ~11% |
+
+nginx adds ~9-11% overhead for simple JSON workers. Framework-heavy workers see similar proportional overhead. The LB enables horizontal scaling and hostname-based routing.
+
+**To reach 1M RPS**: ~120 cores behind nginx (at ~8,000 RPS/core average).
+
+## Scaling Model
+
+workerd is **single-threaded** — one process, one CPU core. Each instance occupies exactly 1 core.
+
+| CPU Cores | 1 instance | 2 instances | 4 instances |
+|-----------|-----------|-------------|-----------|
+| 1 | 100% CPU | N/A | N/A |
+| 2 | CPU saturated | Context-switch overhead | N/A |
+| 4+ | 25% CPU | 50% CPU | 100% CPU, linear RPS |
+
+Scaling only improves throughput when there are more cores than instances. On a 2-core VM, 1 instance is already saturating both cores — adding a 2nd instance adds scheduling overhead without throughput gain.

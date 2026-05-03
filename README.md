@@ -1,26 +1,10 @@
-# WERKERD
+# WERKERD — Self-Hosted Cloudflare Workers
 
-A self-hosted Cloudflare Workers runtime built on [workerd](https://github.com/cloudflare/workerd) — the open-source Workers runtime from Cloudflare.
+A production-ready, self-hosted runtime for Cloudflare Workers using the open-source [workerd](https://github.com/cloudflare/workerd) binary. Deploy any Cloudflare Workers project to your own server with `werkerd deploy` — zero config changes required.
 
-> **Status**: Operational on Ubuntu 24.04 at `18.171.244.124`  
-> **CLI**: `werkerd deploy` — works like `wrangler deploy` on any Cloudflare Workers project
+**Server**: `18.171.244.124` (Ubuntu 24.04) | **CLI**: `werkerd deploy`
 
-## Features
-
-- **CLI-first**: `werkerd deploy` reads `wrangler.jsonc`, bundles with esbuild, deploys to your server
-- **Hono first-class**: Full Hono framework support — routing, JSON, HTML, middleware
-- **Vite + React SSR first-class**: Build your Vite app and deploy to workerd
-- **100% workerd-native** — no proxy, no emulation, no translation layer
-- **Service bindings** — in-process RPC between workers (`env.NAME.fetch()`)
-- **Durable Objects** — stateful objects with in-memory storage (Counter, ChatRoom)
-- **WebSockets** — real-time bidirectional communication via `WebSocketPair`
-- **ES modules** — `export default { fetch }` format, auto-detected
-- **Environment variables** — `.env` file + text bindings for config
-- **Zero-downtime deploys** — rolling restart across instances
-- **Socket activation** — systemd lazily spawns workers on first request
-- **Load balancing** — Caddy reverse proxy with `/healthz` checks and connection pooling
-- **Scaling** — per-worker instance scaling across multiple ports; ~4,550 RPS/core
-- **Observability** — Caddy admin API on `:2019/metrics` for monitoring
+---
 
 ## Quickstart
 
@@ -28,140 +12,154 @@ A self-hosted Cloudflare Workers runtime built on [workerd](https://github.com/c
 # 1. Install the CLI
 cd werkerd-cli && npm install && npm link
 
-# 2. Deploy any project — zero config editing
-cd examples/hono-app
-npm install
-werkerd deploy --port 8082
+# 2. Deploy any Cloudflare Workers project
+cd examples/hello
+werkerd deploy --port 8080
 
-# 3. Verify
-curl http://18.171.244.124:8082/
+# 3. Test
+curl http://18.171.244.124:8080/
+# Or via nginx LB: curl http://hello.localhost/
 ```
 
-Works on any Cloudflare Workers project — just run `werkerd deploy`.
+Works on any existing Cloudflare Workers project — just run `werkerd deploy`. It reads your `wrangler.jsonc`, bundles with esbuild, uploads, and starts the service.
 
-## Examples
+---
 
-All examples are standard npm projects. Each has `wrangler.jsonc` + `package.json` + `src/index.js`:
+## What This Is
 
-| Project | Directory | Deploy Command | Features |
-|---------|-----------|---------------|----------|
-| **Hello** | `examples/hello/` | `werkerd deploy --port 8084` | Minimal worker, text bindings |
-| **Hono** | `examples/hono-app/` | `werkerd deploy --port 8082` | Full Hono framework, routing, JSON, HTML |
-| **Vite React SSR** | `examples/vite-react/` | `werkerd deploy --port 8083` | Vite build, React SSR on workerd |
-| **Fullstack** | `examples/fullstack/` | `werkerd deploy --port 8085` | Durable Objects, WebSockets, env vars |
-| **API + Auth** | `example-worker/` | `workerd-scale up api 8090` | Service bindings, env vars, multi-worker |
+- **Drop-in `wrangler deploy` replacement**: Works with existing Cloudflare Workers projects
+- **100% workerd-native**: No emulation layer, no translation — real workerd
+- **Hono, Vite+React, SvelteKit first-class**: Full framework support
+- **Service bindings, Durable Objects, WebSockets**: All Cloudflare APIs work
+- **Git-driven scaling**: Edit a config file, push, get more RPS
+- **nginx reverse proxy**: ~9% overhead (vs Caddy's ~2x)
 
-All examples are deployed and live on the server.
-
-## Performance
-
-| Configuration | RPS | p50 Latency | p99 Latency |
-|---|---|---|---|
-| Direct workerd (1 instance, localhost) | **8,873** | 5.5ms | — |
-| Caddy LB :80 → 5 instances | **4,425** | 43ms | 114ms |
-| Caddy LB (unoptimized baseline) | 2,893 | 52ms | 757ms |
-| Hono app (1 instance, localhost) | **926** | 65ms | 476ms |
-| Fullstack (DO counter) | **3,508** | 1.5ms | 269ms |
-| External (London ← US) | ~340 | 250ms | 878ms |
-
-**Scaling**: Each workerd instance delivers ~4,550 RPS per core. Instances scale linearly — 2 instances = 2x throughput. Caddy LB adds ~2x overhead (expected for any L7 proxy). To reach 1M RPS: ~220 cores with direct workerd, ~440 cores behind Caddy.
-
-**Caddy optimizations applied** (connection pooling and keepalive from `workerd-gen-caddyfile`):
-- `max_conns_per_host200` — prevents upstream connection exhaustion
-- `keepalive30s` — reuses TCP connections (biggest win — eliminates per-request handshake)
-- `keepalive_idle_conns100` — pool of warm connections ready for reuse
-- `log level WARN` — reduces I/O pressure from access logging
-- Admin API on `:2019` for `curl localhost:2019/metrics` monitoring
-
-## Live Endpoints
-
-| Port | Worker | Type | Test |
-|------|--------|------|------|
-| `:80` | hello | Caddy LB | `curl 18.171.244.124/` |
-| `:8080` | hello | Service worker | `curl 18.171.244.124:8080/` |
-| `:8081` | hello | Service worker (scale) | `curl 18.171.244.124:8081/` |
-| `:8082` | hono-app | Hono framework | `curl 18.171.244.124:8082/` |
-| `:8083` | vite-react | Vite React SSR | `curl 18.171.244.124:8083/` |
-| `:8084` | hello (cli) | CLI deploy test | `curl 18.171.244.124:8084/` |
-| `:8085` | fullstack | DO + WS | `curl 18.171.244.124:8085/diag` |
-| `:8090` | api + auth | Service bindings | `curl 18.171.244.124:8090/diag` |
-
-## Documentation
-
-| Document | Content |
-|----------|---------|
-| [SKILL.md](docs/SKILL.md) | Complete guide: CLI, examples, wrangler.jsonc, troubleshooting |
-| [configuration.md](docs/configuration.md) | Cap'n Proto config, manifest format, script reference |
-| [deploying.md](docs/deploying.md) | Deployment methods (CLI, git push, manual, SCP) |
-| [scaling.md](docs/scaling.md) | Scale up/down, rollout strategy |
-| [secrets.md](docs/secrets.md) | Environment variables, .env files |
-| [architecture.md](docs/architecture.md) | System diagrams, data flow |
-| [troubleshooting.md](docs/troubleshooting.md) | Common errors, logs, debugging |
-| [howto.md](docs/howto.md) | Recipes: Hono, Vite, DO, KV, WebSockets, SvelteKit |
-
-## CLI Commands
-
-```bash
-werkerd deploy [--port <port>]    # Deploy current project
-werkerd whoami                    # Show server + deployed workers
-```
-
-The server defaults to `root@18.171.244.124`. Override with `export WERKERD_SERVER=root@my-host`.
-
-## Repository Structure
-
-```
-werkerd/
-├── README.md
-├── werkerd-cli/              # The werkerd CLI (npm install && npm link)
-│   ├── bin/werkerd.js
-│   └── lib/
-│       ├── deploy.js         # Deploy pipeline
-│       ├── config-reader.js  # wrangler.jsonc parser
-│       └── capnp-gen.js      # Cap'n Proto config generator
-├── examples/                 # Example projects (standard npm projects)
-│   ├── hello/                # Minimal worker
-│   ├── hono-app/             # Hono framework
-│   ├── vite-react/           # Vite React SSR
-│   └── fullstack/            # DO + WebSocket + env vars
-├── example-worker/           # Legacy examples (manifest.json format)
-├── management-scripts/       # Server-side scripts
-│   ├── bootstrap.sh          # Full server bootstrap
-│   ├── workerd-gen-config    # Config generator (Node.js)
-│   ├── workerd-start         # Systemd exec wrapper
-│   ├── workerd-scale         # Scale up/down/list
-│   ├── workerd-gen-caddyfile # Caddyfile generator
-│   └── workerd@.service      # Systemd template unit
-└── docs/                     # Full documentation
-    ├── SKILL.md
-    ├── architecture.md
-    ├── configuration.md
-    ├── deploying.md
-    ├── howto.md
-    ├── scaling.md
-    ├── secrets.md
-    └── troubleshooting.md
-```
+---
 
 ## Architecture
 
 ```
-Internet → Caddy (:80) → systemd socket → workerd → Worker code
-                ↓           activation         ↓
-           Health checks   Per-instance    Service bindings
-           Load balancing    sockets       Durable Objects
+Internet
+   │
+   ▼
+nginx :80  ←─── Health checks, load balancing, hostname routing
+   │
+   ├── hello.localhost  ──► workerd @ :8080, :8081 (scaled)
+   ├── hono-app.localhost ──► workerd @ :8082
+   ├── fullstack.localhost ──► workerd @ :8085 (DO + WS)
+   └── vite-react.localhost ──► workerd @ :8083
+
+Each workerd process runs in a systemd socket-activated service.
+Scaling = change instance count in scale file → server auto-applies.
 ```
 
-See [docs/architecture.md](docs/architecture.md) for full diagrams.
+---
 
-## Related
+## Live Workers
 
-- [workerd on GitHub](https://github.com/cloudflare/workerd)
-- [Cloudflare Workers docs](https://developers.cloudflare.com/workers/)
-- [Hono](https://hono.dev/)
-- [Caddy docs](https://caddyserver.com/docs/)
-- [systemd socket activation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html)
+| Worker | URL | Direct Port |
+|--------|-----|-------------|
+| hello | `http://hello.localhost/` | `:8080`, `:8081` (scaled) |
+| hono-app | `http://hono-app.localhost/` | `:8082` |
+| fullstack | `http://fullstack.localhost/diag` | `:8085` (DO + WS) |
+| vite-react | `http://vite-react.localhost/api/info` | `:8083` |
 
-## License
+---
 
-MIT
+## CLI Commands
+
+```bash
+# Deploy any Cloudflare Workers project
+werkerd deploy --port 8080
+
+# Override server
+WERKERD_SERVER=root@my-server.com werkerd deploy --port 8080
+```
+
+---
+
+## Scaling
+
+```bash
+# Show server CPU cores and scaling advice
+workerd-scale info
+
+# Set instance count (git-driven: edit file, push, server applies)
+ssh root@18.171.244.124
+echo 2 > /etc/workerd/workers/hello/scale
+workerd-scale set hello 2
+
+# Check status
+workerd-scale list hello
+```
+
+**Scaling only improves RPS if you have more CPU cores than instances.**
+- On a 2-core VM: 1 instance saturates both cores. Scaling to 2 adds overhead.
+- On 4+ cores: Scaling is linear — 1 instance per core = full throughput.
+
+**To reach 1M RPS**: ~120 cores at ~8,000 RPS/core behind nginx.
+
+---
+
+## Performance
+
+| Configuration | RPS | p50 | p99 |
+|---|---|---|---|
+| Direct workerd | **8,957** | 13ms | 93ms |
+| nginx LB (1 backend) | **8,118** | 21ms | 143ms |
+| nginx LB (2 backends) | **8,327** | 20ms | 171ms |
+| Hono via nginx | **2,575** | 15ms | 35ms |
+| Fullstack DO via nginx | **6,846** | 26ms | 1.04s |
+
+**nginx overhead**: ~9-11% for simple JSON workers.
+
+---
+
+## Project Structure
+
+```
+werkerd/
+├── werkerd-cli/           # The CLI (npm install && npm link)
+│   ├── bin/werkerd.js     # Entry point
+│   └── lib/
+│       ├── deploy.js      # Deploy pipeline
+│       ├── config-reader.js  # wrangler.jsonc parser
+│       └── capnp-gen.js    # Cap'n Proto config generator
+├── examples/              # Example projects
+│   ├── hello/             # Minimal worker
+│   ├── hono-app/          # Hono framework
+│   ├── vite-react/        # Vite + React SSR
+│   └── fullstack/         # DO + WebSocket + env vars
+├── management-scripts/    # Server-side scripts
+│   ├── bootstrap.sh       # Fresh server setup
+│   ├── workerd-scale      # Git-driven scaling CLI
+│   ├── workerd-gen-nginx  # nginx config generator
+│   ├── workerd-gen-config # Cap'n Proto config generator
+│   └── post-receive       # Git push deploy hook
+└── docs/                  # Full documentation
+```
+
+---
+
+## Documentation
+
+| Doc | Contents |
+|-----|---------|
+| [SKILL.md](docs/SKILL.md) | Complete guide: CLI, wrangler.jsonc schema, troubleshooting |
+| [architecture.md](docs/architecture.md) | System diagrams, component layers, data flow |
+| [configuration.md](docs/configuration.md) | Cap'n Proto config schema, wrangler.jsonc reference |
+| [deploying.md](docs/deploying.md) | All deployment methods: CLI, git push, rollback |
+| [scaling.md](docs/scaling.md) | Git-driven scaling, workerd-scale CLI, resource limits |
+| [secrets.md](docs/secrets.md) | Environment variables, .env handling, security |
+| [troubleshooting.md](docs/troubleshooting.md) | All known errors, diagnostics, fixes |
+| [howto.md](docs/howto.md) | Recipes: Hono, Vite, DO, KV, WebSockets, SvelteKit |
+
+---
+
+## Key Files
+
+- `/etc/workerd/workers/<name>/scale` — Desired instance count (1, 2, 3...)
+- `/etc/workerd/workers/<name>/ports` — Active port list
+- `/etc/nginx/sites-available/workerd` — Generated nginx config
+- `/usr/local/bin/workerd-scale` — Scaling CLI
+- `/usr/local/bin/workerd-gen-nginx` — Regenerates nginx config

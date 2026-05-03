@@ -1,4 +1,7 @@
 
+
+
+
 Test everything 
 
 vite, Service bindings between workers, env vars, etc
@@ -47,6 +50,18 @@ update documentation and push to github
 
 load balancer is supposed to improve throughput, you can;t tell me you're just settling for LB which does more harm than good, maybe because your scaling is creatin g new process instead of new isolate, dont dwell on this, just find the problem
 
+
+Find out how would perfomr if i have powerful server, do it local on this computer
+
+
+/tmp/multi-socket.capnp:20:49-60: Couldn't read file for embed: /tmp/t.js
+FAIL
+
+this type of error is always happening but you never learn, pleae document it 
+
+
+
+
 ensure will survive reboot 
 
 
@@ -57,6 +72,31 @@ Dashboard, which is also deployed via workerd,
 
 
 assets binding: how?
+
+repo is public: you are doxxxxing my ip:18.171.244.124
+
+
+
+Review documentation, ensure can setup brand new Vm with no pitfall, theres all those patch things you fall into and fix later, like that relative path bullshit, permissions issues, and all others: remember them 
+Everythin shpuld be secure no remembering to create some file manually or add this to that file whenever deploy, ironclad, ensure works , just following documentation, and normal repo i have been pushint to ewrangler deploy, i send it to self host sand just works 
+
+
+
+also scaling up should improve throughput, you can bullshit your way out of this, keep kicking that can down the road but your work is just shit 
+
+
+
+
+
+explore and test to find the best nginx tuning 
+things like try worker_cpu_affinity 
+try many many more nginx optimizations
+
+unix ports of course likely to be faster
+
+
+
+
 
 
 

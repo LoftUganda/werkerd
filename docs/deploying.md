@@ -1,20 +1,50 @@
 # Deploying Workers
 
-This guide covers deploying workers to the self-hosted workerd platform (`18.171.244.124`).
+werkerd supports three deployment methods: CLI deploy (recommended), git push, and manual SCP.
 
 ## Deployment Methods
 
-There are three ways to deploy:
+| Method | Best For | Zero Downtime |
+|--------|----------|---------------|
+| `werkerd deploy` (CLI) | Single workers, quick iteration | Via rolling restart |
+| Git push | Automated CI/CD pipelines | Yes |
+| SCP + restart | Debugging, one-off fixes | No |
 
-1. **Git push** (recommended) — Push to bare repo on the server
-2. **Manual deploy** — Run `workerd-deploy` from your project
-3. **SCP + manual restart** — For one-off deployments
+## CLI Deploy (Recommended)
+
+The `werkerd deploy` CLI reads your `wrangler.jsonc`, bundles with esbuild, uploads, and starts the service — zero config changes.
+
+```bash
+# Install CLI
+cd werkerd-cli && npm install && npm link
+
+# Deploy any Cloudflare Workers project
+cd ~/my-worker
+werkerd deploy --port 8080
+```
+
+What it does:
+1. Reads `wrangler.jsonc` from current directory
+2. Auto-detects npm dependencies and bundles with esbuild if needed
+3. Generates Cap'n Proto config for workerd
+4. Copies `.env` from project (if exists) for secrets
+5. Uploads everything to server via SCP
+6. Creates systemd socket unit and starts the service
+7. Regenerates nginx config and reloads nginx
+8. Health-checks the endpoint
+
+Options:
+```bash
+werkerd deploy --port 8080           # Deploy to port 8080 (default)
+WERKERD_SERVER=root@my-server.com werkerd deploy  # Override server
+```
 
 ## Git Push Deploy
 
-### First-Time Setup
+### Server Setup (One-Time)
 
 On the server:
+
 ```bash
 # Create bare git repo
 sudo mkdir -p /var/git/my-worker.git
@@ -22,170 +52,191 @@ cd /var/git/my-worker.git
 sudo git init --bare
 sudo git symbolic-ref HEAD refs/heads/main
 
-# Install the post-receive hook
-sudo cp /path/to/post-receive hooks/post-receive
-sudo sed -i 's/PLACEHOLDER/my-worker/' hooks/post-receive
-sudo chmod +x hooks/post-receive
+# Copy post-receive hook
+sudo cp /usr/local/bin/post-receive-template /var/git/my-worker.git/hooks/post-receive
+sudo sed -i 's/PLACEHOLDER/my-worker/' /var/git/my-worker.git/hooks/post-receive
+sudo chmod +x /var/git/my-worker.git/hooks/post-receive
 
-# Set up the worker directory
+# Set up worker directory
 sudo mkdir -p /etc/workerd/workers/my-worker
 echo "8080" | sudo tee /etc/workerd/workers/my-worker/ports
+echo "1" | sudo tee /etc/workerd/workers/my-worker/scale  # start with 1 instance
 
-# Generate initial config and start
-sudo /usr/local/bin/workerd-gen-config my-worker 8080
-sudo /usr/local/bin/workerd-scale up my-worker 8080
+# Generate initial Cap'n Proto config
+sudo workerd-gen-config my-worker 8080
+
+# Start the worker
+sudo workerd-scale start my-worker 8080
 ```
 
-On your local machine:
+### Local Setup
+
 ```bash
 # In your worker project directory
 git init
 git checkout -b main
-git add worker.js manifest.json
+git add worker.js wrangler.jsonc
 git commit -m "initial deploy"
+
+# Add remote (deploy user needs SSH key access)
 git remote add deploy ssh://deploy@18.171.244.124:/var/git/my-worker.git
+
 git push deploy main
 ```
 
-On first push, the server must have the `deploy` user's SSH key in `authorized_keys`.
+The `deploy` user's SSH public key must be in `/home/deploy/.ssh/authorized_keys` on the server.
 
-### Subsequent Deploys
+### How the Post-Receive Hook Works
 
 ```bash
-# Make changes to worker.js
-git add worker.js
-git commit -m "fix: update handler"
-git push deploy main
+#!/bin/bash
+# /var/git/<worker>.git/hooks/post-receive
+
+WORKER="PLACEHOLDER"
+GIT_DIR="/var/git/${WORKER}.git"
+DEPLOY_DIR="/etc/workerd/workers/${WORKER}"
+PORTS_FILE="${DEPLOY_DIR}/ports"
+
+while read oldrev newrev refname; do
+    [ "$refname" = "refs/heads/main" ] || continue
+
+    # 1. Checkout worker.js to deploy dir
+    git --work-tree="$DEPLOY_DIR" --git-dir="$GIT_DIR" checkout -f main -- worker.js
+
+    # 2. Regenerate configs for all active ports
+    while IFS= read -r port; do
+        workerd-gen-config "$WORKER" "$port"
+    done < "$PORTS_FILE"
+
+    # 3. Regenerate nginx config and reload
+    workerd-gen-nginx
+    nginx -t && systemctl reload nginx
+
+    # 4. Rolling restart (zero downtime)
+    while IFS= read -r port; do
+        systemctl restart "workerd@${WORKER}:${port}"
+        sleep 0.5
+    done < "$PORTS_FILE"
+done
 ```
 
-The post-receive hook:
-1. Checks out `worker.js` to `/etc/workerd/workers/my-worker/`
-2. Regenerates configs for all active ports
-3. Restarts all instances sequentially (zero-downtime rolling restart)
+### Scaling via Git Push
 
-### Multi-Worker Deploys (Groups)
+To scale a worker, edit the scale file and push:
 
-If your worker depends on other workers in the same group (e.g., `api` depends on `auth` via service binding), include the group workers in the repo:
+```bash
+# Locally: change scale file
+echo 2 > /etc/workerd/workers/my-worker/scale
+git add -A && git commit && git push deploy main
+
+# Server post-receive hook applies: workerd-scale set my-worker 2
+```
+
+The post-receive hook reads the `scale` file after checkout and calls `workerd-scale set`.
+
+### Multi-Worker Groups (Service Bindings)
+
+If your worker uses service bindings to other workers in the same process group:
 
 ```
 my-project/
   worker.js          ← Main worker (api)
-  manifest.json       ← Lists group: ["api", "auth"]
-  auth-worker.js      ← Group member worker
+  wrangler.jsonc      ← Lists services: [{ binding: "AUTH", service: "auth" }]
+  auth-worker.js      ← Group member worker (copied by hook)
 ```
 
-The post-receive hook checks out `auth-worker.js` alongside `worker.js`:
+The post-receive hook can copy group workers:
 
 ```bash
-# Post-receive hook handles group workers:
 if git --git-dir="$GIT_DIR" cat-file -e "$newrev:auth-worker.js" 2>/dev/null; then
-    git --git-dir="$GIT_DIR" cat-file blob "$newrev:auth-worker.js" > "$AUTH_DIR/worker.js"
+    git --git-dir="$GIT_DIR" cat-file blob "$newrev:auth-worker.js" > "$DEPLOY_DIR/group-auth.js"
 fi
 ```
 
-### Deploy Script (Alternative)
+## Manual SCP Deploy
 
-The `deploy.sh` script uses wrangler to build and push:
-
-```bash
-#!/bin/bash
-# deploy.sh — run from worker project root
-WORKER=${1:-$(basename "$(pwd)")}
-SERVER=${WORKERD_SERVER:-"deploy@18.171.244.124"}
-
-# Build with wrangler (dry-run)
-wrangler deploy --dry-run --outdir dist
-
-# Push to bare git repo on server
-cd dist
-git init
-git checkout -b main
-git add worker.js
-git commit -m "deploy $(date -u +%Y%m%dT%H%M%SZ)"
-git remote add deploy "ssh://${SERVER}:/var/git/${WORKER}.git" 2>/dev/null || true
-git push deploy main --force
-```
-
-### Manual SCP
-
-For one-off debugging:
-```bash
-scp worker.js ubuntu@18.171.244.124:/etc/workerd/workers/my-worker/
-ssh ubuntu@18.171.244.124 sudo systemctl restart 'workerd@my-worker:*'
-```
-
-## Deploy Checklist
-
-Before deploying, verify:
-
-- [ ] `manifest.json` has correct `name`, `entrypoint`, `compatibilityDate`
-- [ ] `group` includes all workers that need to share a process
-- [ ] `bindings` match what your worker code expects
-- [ ] `env` lists all environment variables used
-- [ ] `.env` file exists with values (if using env vars)
-- [ ] Worker responds on `/healthz` with `200 OK`
-- [ ] Worker compiles: `workerd compile config.capnp` (on server)
-
-## Post-Deploy Verification
+For one-off debugging or when git isn't set up:
 
 ```bash
-# Check service status
-ssh ubuntu@18.171.244.124 systemctl status 'workerd@my-worker:*'
+# Upload worker.js directly
+scp worker.js root@18.171.244.124:/etc/workerd/workers/my-worker/
 
-# Check direct port access
-curl -s http://18.171.244.124:8080/
-
-# Check via Caddy
-curl -s http://18.171.244.124/
-
-# View logs
-ssh ubuntu@18.171.244.124 journalctl -u 'workerd@my-worker:*' -n 20
-
-# Verify git log
-ssh ubuntu@18.171.244.124 git --git-dir=/var/git/my-worker.git log --oneline
+# Restart
+ssh root@18.171.244.124 systemctl restart 'workerd@my-worker:*'
 ```
 
 ## Rollback
 
 ```bash
 # View git history on server
-ssh ubuntu@18.171.244.124 git --git-dir=/var/git/my-worker.git log --oneline
+ssh root@18.171.244.124 git --git-dir=/var/git/my-worker.git log --oneline
 
-# Checkout a previous commit (reverts worker.js)
-# On the server:
+# Checkout a previous commit
+ssh root@18.171.244.124
 cd /etc/workerd/workers/my-worker
-sudo git --git-dir=/var/git/my-worker.git checkout <commit-hash> -- worker.js
-sudo /usr/local/bin/workerd-gen-config my-worker <port>
-sudo systemctl restart 'workerd@my-worker:*'
+git --git-dir=/var/git/my-worker.git checkout <commit-hash> -- worker.js
+workerd-gen-config my-worker 8080
+systemctl restart 'workerd@my-worker:*'
+```
+
+## Post-Deploy Verification
+
+```bash
+# Check service status
+ssh root@18.171.244.124 systemctl status 'workerd@my-worker:*'
+
+# Check direct port access
+curl -s http://18.171.244.124:8080/
+
+# Check via nginx LB
+curl -s http://my-worker.localhost/
+
+# Health check
+curl -sf http://localhost:8080/healthz && echo " OK" || echo " FAIL"
+
+# View logs
+ssh root@18.171.244.124 journalctl -u 'workerd@my-worker:*' -n 20
+
+# nginx status
+ssh root@18.171.244.124 curl -s http://localhost/nginx_status
 ```
 
 ## Environment-Specific Deploys
 
-Use separate worker names for environments:
+Use different worker names for different environments:
+
 ```bash
 # Staging
-workerd-scale up my-worker-staging 8081
-
-# Production
-workerd-scale up my-worker 8080
+werkerd deploy --port 8081  # worker name from wrangler.jsonc
+# Or override:
+NAME=my-worker-staging werkerd deploy --port 8081
 ```
 
-Or use different ports:
+## Cron / Scheduled Workers
+
+workerd supports cron triggers via the Cap'n Proto config. Use `workerd-gen-config` with a modified config, or set up a systemd timer:
+
 ```bash
-# Dev on 8080, staging on 8081, prod on 8082
+# Create a timer for hourly cron
+cat > /etc/systemd/system/workerd-my-worker-cron.timer <<EOF
+[Unit]
+Description=Hourly cron trigger for my-worker
+
+[Timer]
+OnCalendar=*:0:0
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
 ```
 
-## Cron & Scheduled Workers
+## Deploy Checklist
 
-workerd supports scheduled/cron triggers. Configure in the Cap'n Proto config:
-```capnp
-services = [
-  (name = "main", worker = .mainWorker),
-],
-sockets = [
-  ( name = "http", address = "*:8080", http = (), service = "main" ),
-],
-timers = [
-  ( name = "cleanup", schedule = "0 * * * *", handler = .onSchedule ),
-],
-```]]>
+Before deploying:
+
+- [ ] `wrangler.jsonc` has correct `name`, `main`, `compatibility_date`
+- [ ] Worker code is in `src/index.js` (or wherever `main` points)
+- [ ] `.env` exists for secrets (will be copied to server)
+- [ ] `npm install` run if the project has dependencies
+- [ ] Worker responds on `/healthz` with `200 OK`

@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-WORKER="PLACEHOLDER"   # replaced when hook is installed
+WORKER="PLACEHOLDER"
 GIT_DIR="/var/git/${WORKER}.git"
 DEPLOY_DIR="/etc/workerd/workers/${WORKER}"
 PORTS_FILE="${DEPLOY_DIR}/ports"
@@ -21,6 +21,10 @@ while read oldrev newrev refname; do
         /usr/local/bin/workerd-gen-config "$WORKER" "$port"
         echo "  config.${port}.capnp written"
     done < "$PORTS_FILE"
+
+    echo "→ Regenerating nginx..."
+    /usr/local/bin/workerd-gen-nginx
+    nginx -t && systemctl reload nginx || true
 
     echo "→ Rolling restart..."
     while IFS= read -r port; do
