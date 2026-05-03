@@ -1,117 +1,183 @@
 # WERKERD — Self-Hosted Cloudflare Workers
 
-A production-ready, self-hosted runtime for Cloudflare Workers using the open-source [workerd](https://github.com/cloudflare/workerd) binary. Deploy any Cloudflare Workers project to your own server with `werkerd deploy` — zero config changes required.
+Deploy any Cloudflare Workers project to your own server. Zero config changes, git push deploy, automatic scaling.
 
-**Server**: `18.171.244.124` (Ubuntu 24.04) | **CLI**: `werkerd deploy`
+---
+
+## Prerequisites
+
+- A server running **Ubuntu 22.04+** (AWS, DigitalOcean, Hetzner, etc.)
+- SSH access to an account with **passwordless sudo** (standard on cloud images)
+- A domain with DNS A record pointing to your server (`*` wildcard recommended)
+- SSH key on your local machine (`~/.ssh/id_ed25519.pub` or similar)
 
 ---
 
 ## Quickstart
 
+### Step 1 — Bootstrap the server
+
 ```bash
-# 1. Install the CLI
-cd werkerd-cli && npm install && npm link
+# Clone the repo and copy scripts to your server
+git clone https://github.com/LoftUganda/werkerd.git /tmp/werkerd
+scp -r /tmp/werkerd/management-scripts YOUR_USER@YOUR_SERVER:/tmp/
 
-# 2. Deploy any Cloudflare Workers project
-cd examples/hello
-werkerd deploy --port 8080
-
-# 3. Test
-curl http://18.171.244.124:8080/
-# Or via nginx LB: curl http://hello.localhost/
+# Run bootstrap (enter your SSH password when prompted)
+ssh YOUR_USER@YOUR_SERVER sudo bash /tmp/management-scripts/bootstrap.sh
 ```
 
-Works on any existing Cloudflare Workers project — just run `werkerd deploy`. It reads your `wrangler.jsonc`, bundles with esbuild, uploads, and starts the service.
+The SSH user you connect with must have passwordless sudo — standard on AWS Ubuntu, DigitalOcean, Hetzner, etc. Bootstrap installs everything under that same user.
+
+### Step 2 — Add your SSH key
+
+```bash
+# Passwordless SSH — no more password prompts
+ssh-copy-id -i ~/.ssh/id_ed25519.pub YOUR_USER@YOUR_SERVER
+
+# Or manually:
+cat ~/.ssh/id_ed25519.pub | ssh YOUR_USER@YOUR_SERVER 'tee -a ~/.ssh/authorized_keys'
+```
+
+Test: `ssh YOUR_USER@YOUR_SERVER echo "ok"` — should print `ok` with no password.
+
+### Step 3 — Point DNS at your server
+
+At your DNS provider, add an **A record**:
+
+```
+Host: *
+Value: YOUR_SERVER_IP
+TTL: 300 (or auto)
+```
+
+Wildcard `*` makes all subdomains (`hello.yourdomain.com`, `api.yourdomain.com`, etc.) resolve to your server.
+
+### Step 4 — Create a worker and push
+
+**For a static site (React/Vue/Svelte with vite build):**
+
+```bash
+# On server — create bare repo
+ssh YOUR_USER@YOUR_SERVER 'git init --bare /var/git/my-site.git'
+ssh YOUR_USER@YOUR_SERVER 'git config --file /var/git/my-site.git/config receive.denyCurrentBranch ignore'
+
+# On server — install post-receive hook
+ssh YOUR_USER@YOUR_SERVER 'cp /usr/local/bin/post-receive-template /var/git/my-site.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'sed -i "s/^WORKER=.*/WORKER=\"my-site\"/" /var/git/my-site.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'sed -i "s/^DOMAIN=.*/DOMAIN=\"my-site.yourdomain.com\"/" /var/git/my-site.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'sed -i "s/^STATIC=.*/STATIC=\"1\"/" /var/git/my-site.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'chmod +x /var/git/my-site.git/hooks/post-receive'
+
+# On local — clone, build, push
+git clone https://github.com/YOU/my-site.git
+cd my-site
+git remote add deploy ssh://YOUR_USER@YOUR_SERVER:/var/git/my-site.git
+npm install && npm run build
+git add -f dist/ && git commit -m "build" && git push deploy main
+```
+
+**For a JavaScript worker (Cloudflare Workers format):**
+
+```bash
+# On server — create bare repo
+ssh YOUR_USER@YOUR_SERVER 'git init --bare /var/git/hello.git'
+ssh YOUR_USER@YOUR_SERVER 'git config --file /var/git/hello.git/config receive.denyCurrentBranch ignore'
+
+# On server — install post-receive hook
+ssh YOUR_USER@YOUR_SERVER 'cp /usr/local/bin/post-receive-template /var/git/hello.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'sed -i "s/^WORKER=.*/WORKER=\"hello\"/" /var/git/hello.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'chmod +x /var/git/hello.git/hooks/post-receive'
+
+# On local — clone and push
+git clone https://github.com/YOU/hello-worker.git
+cd hello-worker
+git remote add deploy ssh://YOUR_USER@YOUR_SERVER:/var/git/hello.git
+git push deploy main
+```
+
+The worker is live at `http://hello.yourdomain.com/` — nginx routes by hostname.
 
 ---
 
-## What This Is
+## Using the CLI
 
-- **Drop-in `wrangler deploy` replacement**: Works with existing Cloudflare Workers projects
-- **100% workerd-native**: No emulation layer, no translation — real workerd
-- **Hono, Vite+React, SvelteKit first-class**: Full framework support
-- **Service bindings, Durable Objects, WebSockets**: All Cloudflare APIs work
-- **Git-driven scaling**: Edit a config file, push, get more RPS
-- **nginx reverse proxy**: ~9% overhead (vs Caddy's ~2x)
+For workers with bindings (KV, Durable Objects, WebSockets, etc.):
+
+```bash
+# Install CLI
+cd werkerd-cli && npm install && npm link
+
+# Deploy
+cd ~/my-worker
+werkerd deploy --port 8080
+
+# Verify
+curl http://hello.localhost/
+```
+
+The CLI handles: esbuild bundling, `manifest.json` creation, config generation, service restart.
+
+---
+
+## What You Get
+
+| Feature | Status |
+|---------|--------|
+| `werkerd deploy` CLI | Workers with KV, DO, WebSockets, env vars |
+| Git push deploy | Zero-downtime, automatic |
+| Static sites (Cloudflare Pages-style) | nginx serves `dist/` |
+| nginx load balancer | ~9% overhead, hostname routing |
+| Git-driven scaling | `workerd-scale set <worker> N` |
+| systemd socket activation | Auto-restart on crash |
 
 ---
 
 ## Architecture
 
 ```
-Internet
-   │
-   ▼
-nginx :80  ←─── Health checks, load balancing, hostname routing
-   │
-   ├── hello.localhost  ──► workerd @ :8080, :8081 (scaled)
-   ├── hono-app.localhost ──► workerd @ :8082
-   ├── fullstack.localhost ──► workerd @ :8085 (DO + WS)
-   └── vite-react.localhost ──► workerd @ :8083
-
-Each workerd process runs in a systemd socket-activated service.
-Scaling = change instance count in scale file → server auto-applies.
+Browser ──── HTTPS ──── nginx :80 ──── hostname routing
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+         hello.yourdomain    api.yourdomain    mysite.yourdomain
+              │               │               │
+         workerd :8080    workerd :8090    nginx static
+              │               │               (dist/ folder)
+         (JavaScript)    (JavaScript)
 ```
 
 ---
 
-## Live Workers
+## Deployment Methods
 
-| Worker | URL | Direct Port |
-|--------|-----|-------------|
-| hello | `http://hello.localhost/` | `:8080`, `:8081` (scaled) |
-| hono-app | `http://hono-app.localhost/` | `:8082` |
-| fullstack | `http://fullstack.localhost/diag` | `:8085` (DO + WS) |
-| vite-react | `http://vite-react.localhost/api/info` | `:8083` |
+| Method | Use When |
+|--------|----------|
+| `werkerd deploy` | JavaScript workers with bindings |
+| Git push | CI/CD, static sites, any worker |
+| SCP + restart | One-off debugging |
+
+See [docs/deploying.md](docs/deploying.md) for full guide including rollback and secrets.
 
 ---
 
-## CLI Commands
+## Troubleshooting
 
+**`Permission denied (publickey)` on git push:**
 ```bash
-# Deploy any Cloudflare Workers project
-werkerd deploy --port 8080
-
-# Override server
-WERKERD_SERVER=root@my-server.com werkerd deploy --port 8080
+ssh-copy-id -i ~/.ssh/id_ed25519.pub YOUR_USER@YOUR_SERVER
 ```
 
----
-
-## Scaling
-
+**nginx 502 Bad Gateway:**
 ```bash
-# Show server CPU cores and scaling advice
-workerd-scale info
-
-# Set instance count (git-driven: edit file, push, server applies)
-ssh root@18.171.244.124
-echo 2 > /etc/workerd/workers/hello/scale
-workerd-scale set hello 2
-
-# Check status
-workerd-scale list hello
+ssh YOUR_USER@YOUR_SERVER 'curl http://localhost:8080/'
+ssh YOUR_USER@YOUR_SERVER 'sudo systemctl reload nginx'
 ```
 
-**Scaling only improves RPS if you have more CPU cores than instances.**
-- On a 2-core VM: 1 instance saturates both cores. Scaling to 2 adds overhead.
-- On 4+ cores: Scaling is linear — 1 instance per core = full throughput.
-
-**To reach 1M RPS**: ~120 cores at ~8,000 RPS/core behind nginx.
-
----
-
-## Performance
-
-| Configuration | RPS | p50 | p99 |
-|---|---|---|---|
-| Direct workerd | **8,957** | 13ms | 93ms |
-| nginx LB (1 backend) | **8,118** | 21ms | 143ms |
-| nginx LB (2 backends) | **8,327** | 20ms | 171ms |
-| Hono via nginx | **2,575** | 15ms | 35ms |
-| Fullstack DO via nginx | **6,846** | 26ms | 1.04s |
-
-**nginx overhead**: ~9-11% for simple JSON workers.
+**DNS not working:**
+```bash
+dig hello.yourdomain.com  # should show YOUR_SERVER_IP
+curl -H "Host: hello.yourdomain.com" http://YOUR_SERVER_IP/
+```
 
 ---
 
@@ -119,47 +185,33 @@ workerd-scale list hello
 
 ```
 werkerd/
-├── werkerd-cli/           # The CLI (npm install && npm link)
-│   ├── bin/werkerd.js     # Entry point
+├── werkerd-cli/              # npm install && npm link
 │   └── lib/
-│       ├── deploy.js      # Deploy pipeline
+│       ├── deploy.js         # CLI deploy pipeline
 │       ├── config-reader.js  # wrangler.jsonc parser
-│       └── capnp-gen.js    # Cap'n Proto config generator
-├── examples/              # Example projects
-│   ├── hello/             # Minimal worker
-│   ├── hono-app/          # Hono framework
-│   ├── vite-react/        # Vite + React SSR
-│   └── fullstack/         # DO + WebSocket + env vars
-├── management-scripts/    # Server-side scripts
-│   ├── bootstrap.sh       # Fresh server setup
-│   ├── workerd-scale      # Git-driven scaling CLI
-│   ├── workerd-gen-nginx  # nginx config generator
-│   ├── workerd-gen-config # Cap'n Proto config generator
-│   └── post-receive       # Git push deploy hook
-└── docs/                  # Full documentation
+│       └── capnp-gen.js      # Cap'n Proto config generator
+├── management-scripts/       # Server setup scripts
+│   ├── bootstrap.sh          # Fresh server setup
+│   ├── workerd-scale        # Scaling CLI (set|start|stop|list|info)
+│   ├── workerd-gen-nginx     # nginx upstream generator
+│   ├── workerd-gen-config    # Cap'n Proto config generator
+│   ├── workerd-start         # systemd ExecStart wrapper
+│   ├── workerd@.service      # systemd template unit
+│   └── post-receive          # Git push deploy hook
+├── examples/                 # Example workers
+└── docs/                     # Full documentation
 ```
 
 ---
 
 ## Documentation
 
-| Doc | Contents |
-|-----|---------|
-| [SKILL.md](docs/SKILL.md) | Complete guide: CLI, wrangler.jsonc schema, troubleshooting |
-| [architecture.md](docs/architecture.md) | System diagrams, component layers, data flow |
-| [configuration.md](docs/configuration.md) | Cap'n Proto config schema, wrangler.jsonc reference |
-| [deploying.md](docs/deploying.md) | All deployment methods: CLI, git push, rollback |
-| [scaling.md](docs/scaling.md) | Git-driven scaling, workerd-scale CLI, resource limits |
-| [secrets.md](docs/secrets.md) | Environment variables, .env handling, security |
-| [troubleshooting.md](docs/troubleshooting.md) | All known errors, diagnostics, fixes |
-| [howto.md](docs/howto.md) | Recipes: Hono, Vite, DO, KV, WebSockets, SvelteKit |
-
----
-
-## Key Files
-
-- `/etc/workerd/workers/<name>/scale` — Desired instance count (1, 2, 3...)
-- `/etc/workerd/workers/<name>/ports` — Active port list
-- `/etc/nginx/sites-available/workerd` — Generated nginx config
-- `/usr/local/bin/workerd-scale` — Scaling CLI
-- `/usr/local/bin/workerd-gen-nginx` — Regenerates nginx config
+| Doc | What It Covers |
+|-----|----------------|
+| [SKILL.md](docs/SKILL.md) | Complete reference: CLI, schema, troubleshooting |
+| [deploying.md](docs/deploying.md) | Git push, CLI, static sites, rollback |
+| [scaling.md](docs/scaling.md) | `workerd-scale` commands, git-driven scaling |
+| [architecture.md](docs/architecture.md) | System design, network flow, performance |
+| [configuration.md](docs/configuration.md) | wrangler.jsonc schema, Cap'n Proto |
+| [troubleshooting.md](docs/troubleshooting.md) | All errors and fixes |
+| [howto.md](docs/howto.md) | Recipes: Hono, DO, KV, WebSockets |

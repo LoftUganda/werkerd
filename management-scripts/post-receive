@@ -1,37 +1,144 @@
 #!/bin/bash
-# /var/git/<worker>.git/hooks/post-receive
-# Receives: <oldrev> <newrev> <refname> on stdin
-# Called by git push to the bare repo
+# post-receive — git push deploy hook for werkerd
+#
+# Usage: Copy this to /var/git/<worker>.git/hooks/post-receive
+#        Edit WORKER name below before installing on server
+#
+# Supports two modes:
+#   STATIC=1  — serve dist/ folder as static files via nginx
+#   WORKER=1  — run workerd worker (default, when STATIC is unset)
+#
+# Before installing, configure the worker name:
+#   sed -i 's/^WORKER=.*/WORKER="my-worker"/' hooks/post-receive
+#
+# For static sites, also set DOMAIN and STATIC=1:
+#   sed -i 's/^DOMAIN=.*/DOMAIN="myapp.example.com"/' hooks/post-receive
+#   sed -i 's/^STATIC=.*/STATIC="1"/' hooks/post-receive
+#
+# Requirements: The SSH user must have passwordless sudo (standard on
+# AWS Ubuntu, DigitalOcean, etc.). This hook uses `sudo -n` for all
+# privileged commands.
 
 set -euo pipefail
 
-WORKER="PLACEHOLDER"
+# sudo wrapper — fails fast if passwordless sudo is not configured
+sdo() {
+    sudo -n "$@" 2>/dev/null || {
+        echo "ERROR: sudo requires password. Ensure the SSH user has passwordless sudo." >&2
+        exit 1
+    }
+}
+
+# ── CONFIGURATION ──────────────────────────────────────────────────────────────
+WORKER="PLACEHOLDER"           # Worker name (edit before installing)
+DOMAIN="${WORKER}.hey.ug"      # Domain for nginx routing
+STATIC="${STATIC:-}"            # Set to "1" for static site (nginx serve)
+DISTDIR="${DISTDIR:-dist}"      # Directory containing built files
+# ───────────────────────────────────────────────────────────────────────────────
+
 GIT_DIR="/var/git/${WORKER}.git"
 DEPLOY_DIR="/etc/workerd/workers/${WORKER}"
-PORTS_FILE="${DEPLOY_DIR}/ports"
+PORT=8080
 
 while read oldrev newrev refname; do
     [ "$refname" = "refs/heads/main" ] || continue
 
-    echo "→ Checking out worker.js..."
-    git --work-tree="$DEPLOY_DIR" --git-dir="$GIT_DIR" checkout -f main -- worker.js
+    echo "→ Deploying ${WORKER}..."
 
-    echo "→ Regenerating configs..."
-    while IFS= read -r port; do
-        /usr/local/bin/workerd-gen-config "$WORKER" "$port"
-        echo "  config.${port}.capnp written"
-    done < "$PORTS_FILE"
+    mkdir -p "$DEPLOY_DIR"
 
-    echo "→ Regenerating nginx..."
-    /usr/local/bin/workerd-gen-nginx
-    nginx -t && systemctl reload nginx || true
+    if [ -n "$STATIC" ]; then
+        # ── STATIC SITE MODE ──────────────────────────────────────────────────
+        echo "→ Checking out ${DISTDIR}/..."
+        git --work-tree="$DEPLOY_DIR" --git-dir="$GIT_DIR" checkout -f main -- "${DISTDIR}/" 2>/dev/null || true
+        chmod -R +r "$DEPLOY_DIR/${DISTDIR}" 2>/dev/null || true
 
-    echo "→ Rolling restart..."
-    while IFS= read -r port; do
-        sudo systemctl restart "workerd@${WORKER}:${port}"
-        echo "  restarted :${port}"
-        sleep 0.5
-    done < "$PORTS_FILE"
+        echo "→ Configuring nginx..."
+        cat > /etc/nginx/sites-available/"${WORKER}" << NGXEOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
 
-    echo "✔  Deployed $WORKER ($(wc -l < "$PORTS_FILE") instances)"
+    root ${DEPLOY_DIR}/${DISTDIR};
+    index index.html;
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    location ~* \\.html\$ {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+}
+NGXEOF
+
+        ln -sf /etc/nginx/sites-available/"${WORKER}" /etc/nginx/sites-enabled/"${WORKER}" 2>/dev/null || true
+        sdo kill -HUP $(cat /run/nginx.pid) 2>/dev/null || true
+        echo "  nginx reloaded"
+
+    else
+        # ── WORKER MODE ───────────────────────────────────────────────────────
+        echo "→ Checking out worker files..."
+        git --work-tree="$DEPLOY_DIR" --git-dir="$GIT_DIR" checkout -f main 2>/dev/null || true
+
+        if [ ! -f "$DEPLOY_DIR/manifest.json" ]; then
+            cat > "$DEPLOY_DIR/manifest.json" << MANIFEST
+{
+  "name": "${WORKER}",
+  "entrypoint": "worker.js",
+  "compatibilityDate": "2024-09-23",
+  "moduleType": "esm"
+}
+MANIFEST
+            echo "  manifest.json created"
+        fi
+
+        if [ ! -f "$DEPLOY_DIR/ports" ]; then
+            echo "$PORT" > "$DEPLOY_DIR/ports"
+        fi
+
+        if [ ! -f "$DEPLOY_DIR/scale" ]; then
+            echo "1" > "$DEPLOY_DIR/scale"
+        fi
+
+        echo "→ Generating config..."
+        workerd-gen-config "$WORKER" "$PORT" 2>/dev/null || true
+
+        echo "→ Regenerating nginx..."
+        workerd-gen-nginx 2>/dev/null || true
+        sdo kill -HUP $(cat /run/nginx.pid) 2>/dev/null || true
+
+        if [ ! -f "/etc/systemd/system/workerd-${WORKER}-${PORT}.socket" ]; then
+            sdo tee "/etc/systemd/system/workerd-${WORKER}-${PORT}.socket" > /dev/null << SOCKEOF
+[Unit]
+Description=Socket for workerd ${WORKER}:${PORT}
+[Socket]
+ListenStream=0.0.0.0:${PORT}
+NoDelay=true
+Service=workerd@${WORKER}:${PORT}.service
+[Install]
+WantedBy=sockets.target
+SOCKEOF
+        fi
+
+        echo "→ Starting service..."
+        sdo systemctl daemon-reload
+        sdo systemctl enable --now "workerd-${WORKER}-${PORT}.socket" 2>/dev/null || true
+        sdo systemctl restart "workerd@${WORKER}:${PORT}.service" 2>/dev/null || true
+    fi
+
+    echo "✔ Deployed ${WORKER}"
+
 done

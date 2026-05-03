@@ -51,11 +51,7 @@ What it does:
 5. Regenerates nginx config (`workerd-gen-nginx`)
 6. Reloads nginx
 
-### workerd-scale start
-
-A `manifest.json` at `/etc/workerd/workers/<worker>/manifest.json` is required for config generation. The `werkerd deploy` CLI creates this automatically.
-
-### workerd-scale start
+### workerd-scale set
 
 Start a new worker instance on a specific port:
 

@@ -35,8 +35,8 @@ From a fresh Ubuntu 22.04+ server:
 
 ```bash
 # On your local machine
-scp management-scripts/bootstrap.sh root@18.171.244.124:/tmp/
-ssh root@18.171.244.124 sudo bash /tmp/bootstrap.sh
+scp management-scripts/bootstrap.sh YOUR_USER@YOUR_SERVER:/tmp/
+ssh YOUR_USER@YOUR_SERVER sudo bash /tmp/management-scripts/bootstrap.sh
 ```
 
 The bootstrap script installs: Node.js 20.x, workerd, nginx, systemd units, management scripts, and creates the `workerd` system user.
@@ -52,7 +52,7 @@ cd ~/my-worker
 werkerd deploy --port 8080
 
 # 3. Verify
-curl http://18.171.244.124:8080/
+curl http://YOUR_SERVER:8080/
 # Or via nginx: curl http://my-worker.localhost/
 ```
 
@@ -378,7 +378,7 @@ Add or remove instances:
 workerd-scale info
 
 # Set instance count (git-driven workflow)
-ssh root@18.171.244.124
+ssh YOUR_USER@YOUR_SERVER
 echo 2 > /etc/workerd/workers/hello/scale
 workerd-scale set hello 2
 

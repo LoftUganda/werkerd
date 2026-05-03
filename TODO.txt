@@ -103,3 +103,21 @@ unix ports of course likely to be faster
 
 
 
+compare workerd vs bun 
+throughput (RPS) per memory usage 
+
+
+
+
+
+
+where did you document setting up server, make sure everything you have done, if someone wen tto repo they would get it right just following your instructions
+
+
+
+
+
+
+
+
+

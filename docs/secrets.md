@@ -91,10 +91,10 @@ But prefer the `.env` file approach — it's already implemented by `workerd-sta
 3. **Rotate secrets by redeploying**:
    ```bash
    # Update .env on server
-   scp .env.prod ubuntu@18.171.244.124:/etc/workerd/workers/hello/.env
+   scp .env.prod YOUR_USER@YOUR_SERVER:/etc/workerd/workers/hello/.env
 
    # Trigger restart to pick up new values
-   ssh ubuntu@18.171.244.124 systemctl restart 'workerd@hello:*'
+   ssh YOUR_USER@YOUR_SERVER systemctl restart 'workerd@hello:*'
    ```
 
 4. **Audit access**: The `.env` file is readable by the `workerd` user only:

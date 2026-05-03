@@ -1,69 +1,94 @@
 #!/bin/bash
 # bootstrap.sh — one-time server setup for self-hosted workerd platform
-# Run as root on Ubuntu 24.04
+#
+# Usage:
+#   git clone https://github.com/LoftUganda/werkerd.git /tmp/werkerd
+#   scp -r /tmp/werkerd/management-scripts YOUR_USER@YOUR_SERVER:/tmp/
+#   ssh YOUR_USER@YOUR_SERVER sudo bash /tmp/management-scripts/bootstrap.sh
+#
+# The SSH user you connect with must have passwordless sudo (standard on
+# AWS Ubuntu, DigitalOcean, Hetzner, etc.). The bootstrap script itself
+# uses that same user for all operations — no new users are created.
 set -euo pipefail
+
+# ── Detect SSH user (the user we connected as before sudo) ──────────────────────
+# When running via `ssh user@host sudo bash script.sh`, SUDO_USER = original user
+SSH_USER="${SUDO_USER:-${1:-}}"
+if [ -z "$SSH_USER" ]; then
+    SSH_USER=$(logname 2>/dev/null) || SSH_USER=$(whoami)
+fi
+
+# If already root (or the SSH user IS root), no sudo needed; otherwise use sudo
+if [ "$(id -u)" = "0" ]; then
+    SUDO=""
+elif [ "$SSH_USER" = "root" ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# The SSH user — directories are chowned to this user so they can write
+CURRENT_USER="$SSH_USER"
 
 echo "========================================="
 echo "Self-Hosted workerd Platform Bootstrap"
 echo "========================================="
+echo "  SSH user: $CURRENT_USER"
 echo ""
 
-# ── 1. Install Node.js ──
+# ── 1. Fix locale warnings ──
+echo "→ Configuring locale..."
+$SUDO apt-get update -qq 2>/dev/null || true
+$SUDO apt-get install -y -qq language-pack-en 2>/dev/null || true
+echo 'LANG=en_US.UTF-8' | $SUDO tee /etc/default/locale > /dev/null 2>&1 || true
+
+# ── 2. Install Node.js ──
 echo "→ Installing Node.js 20.x..."
 if ! command -v node &>/dev/null; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    apt install -y nodejs
+    curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO bash - 2>/dev/null || true
+    $SUDO apt-get install -y nodejs 2>/dev/null || true
 fi
-echo "  Node.js: $(node --version)"
-echo "  npm:     $(npm --version)"
+echo "  Node.js: $(node --version 2>/dev/null || echo 'not found')"
 
-# ── 2. Install workerd ──
+# ── 3. Install workerd ──
 echo "→ Installing workerd..."
 if ! command -v workerd &>/dev/null; then
-    npm install -g workerd
+    npm install -g workerd 2>/dev/null || true
 fi
-WORKERD_BIN=$(which workerd)
-echo "  workerd: $WORKERD_BIN"
-workerd --help 2>&1 | head -3 || true
-
-if [ "$WORKERD_BIN" != "/usr/bin/workerd" ]; then
-    ln -sf "$WORKERD_BIN" /usr/bin/workerd
-    echo "  Symlinked to /usr/bin/workerd"
+if command -v workerd &>/dev/null; then
+    WORKERD_BIN=$(which workerd)
+    [ "$WORKERD_BIN" != "/usr/bin/workerd" ] && $SUDO ln -sf "$WORKERD_BIN" /usr/bin/workerd
+    echo "  workerd: /usr/bin/workerd"
 fi
 
-# ── 3. Install nginx ──
+# ── 4. Install nginx ──
 echo "→ Installing nginx..."
 if ! command -v nginx &>/dev/null; then
-    apt update
-    apt install -y nginx
+    $SUDO apt-get update -qq 2>/dev/null || true
+    $SUDO apt-get install -y nginx 2>/dev/null || true
 fi
-echo "  nginx: $(nginx -v 2>&1)"
+echo "  nginx: $(nginx -v 2>&1 | grep -o '[0-9.]*$')"
 
-# ── 4. Create workerd user ──
-echo "→ Creating workerd user..."
-if ! id workerd &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin workerd
-fi
-echo "  User: workerd (system, no-login)"
+# ── 5. Create workerd system user ──
+echo "→ Creating workerd system user..."
+$SUDO useradd -r -s /usr/sbin/nologin workerd 2>/dev/null || true
+echo "  User: workerd (system, no-login, used for workerd processes only)"
 
-# ── 5. Create directories ──
+# ── 6. Create directories ──
 echo "→ Creating directory structure..."
-mkdir -p /etc/workerd/workers
-mkdir -p /var/lib/workerd/workers
-mkdir -p /var/git
-mkdir -p /etc/nginx/sites-available
-mkdir -p /etc/nginx/sites-enabled
-mkdir -p /var/log/nginx
-chown -R workerd:workerd /etc/workerd /var/lib/workerd /var/git
-chown -R www-data:www-data /var/log/nginx
-echo "  /etc/workerd/workers/"
-echo "  /var/lib/workerd/workers/"
-echo "  /var/git/"
-echo "  /etc/nginx/sites-available/"
+$SUDO mkdir -p /etc/workerd/workers
+$SUDO mkdir -p /var/lib/workerd/workers
+$SUDO mkdir -p /var/git
+$SUDO mkdir -p /etc/nginx/sites-available
+$SUDO mkdir -p /etc/nginx/sites-enabled
+$SUDO mkdir -p /var/log/nginx
+$SUDO chown -R workerd:workerd /etc/workerd /var/lib/workerd 2>/dev/null || true
+$SUDO chown -R www-data:www-data /var/log/nginx 2>/dev/null || true
+echo "  Directories created"
 
-# ── 6. Write main nginx.conf ──
+# ── 7. Write main nginx.conf ──
 echo "→ Writing nginx.conf..."
-cat > /etc/nginx/nginx.conf << 'NginxConf'
+$SUDO tee /etc/nginx/nginx.conf > /dev/null << 'NginxConf'
 user www-data;
 worker_processes auto;
 worker_cpu_affinity auto;
@@ -125,91 +150,92 @@ http {
     include /etc/nginx/sites-enabled/*;
 }
 NginxConf
+echo "  nginx.conf written"
 
-# ── 7. Install management scripts ──
+# ── 8. Install management scripts ──
 echo "→ Installing management scripts..."
-SCRIPTS_DIR="/tmp/werkerd-scripts"
+SCRIPTS_DIR="${HOME}/.werkerd-scripts"
+[ -d /tmp/management-scripts ] && SCRIPTS_DIR="/tmp/management-scripts"
+
+# Fallback: clone repo if scripts dir not found (handles curl-pipe bootstrap)
+if [ ! -d "$SCRIPTS_DIR" ]; then
+    echo "  Scripts dir not found — cloning werkerd repo..."
+    CLONE_DIR=$(mktemp -d)
+    git clone --depth 1 https://github.com/LoftUganda/werkerd.git "$CLONE_DIR" 2>/dev/null || true
+    if [ -d "$CLONE_DIR/management-scripts" ]; then
+        SCRIPTS_DIR="$CLONE_DIR/management-scripts"
+        echo "  Cloned to $SCRIPTS_DIR"
+    fi
+fi
+
 if [ -d "$SCRIPTS_DIR" ]; then
-    cp "$SCRIPTS_DIR"/workerd-gen-config       /usr/local/bin/
-    cp "$SCRIPTS_DIR"/workerd-start            /usr/local/bin/
-    cp "$SCRIPTS_DIR"/workerd-scale             /usr/local/bin/
-    cp "$SCRIPTS_DIR"/workerd-gen-nginx        /usr/local/bin/
-    cp "$SCRIPTS_DIR"/deploy.sh                 /usr/local/bin/workerd-deploy
-    chmod +x /usr/local/bin/workerd-*
-    chmod +x /usr/local/bin/workerd-deploy
+    $SUDO cp "$SCRIPTS_DIR"/workerd-gen-config    /usr/local/bin/
+    $SUDO cp "$SCRIPTS_DIR"/workerd-start         /usr/local/bin/
+    $SUDO cp "$SCRIPTS_DIR"/workerd-scale         /usr/local/bin/
+    $SUDO cp "$SCRIPTS_DIR"/workerd-gen-nginx     /usr/local/bin/
+    $SUDO cp "$SCRIPTS_DIR"/workerd@.service      /usr/local/bin/
+    $SUDO cp "$SCRIPTS_DIR"/post-receive          /usr/local/bin/post-receive-template
+    chmod +x /usr/local/bin/workerd-* 2>/dev/null || true
+    chmod +x /usr/local/bin/post-receive-template 2>/dev/null || true
+    # Make scripts writable by current user (cloned files are root-owned)
+    $SUDO chown "$CURRENT_USER:$CURRENT_USER" /usr/local/bin/post-receive-template
     echo "  Scripts installed to /usr/local/bin/"
 else
-    echo "  WARNING: $SCRIPTS_DIR not found — skipping script install"
+    echo "  WARNING: scripts not found"
 fi
 
-# ── 8. Install systemd unit ──
+# ── 9. Install systemd unit ──
 echo "→ Installing systemd unit..."
-if [ -f "$SCRIPTS_DIR/workerd@.service" ]; then
-    cp "$SCRIPTS_DIR/workerd@.service" /etc/systemd/system/
-    systemctl daemon-reload
+if [ -f /usr/local/bin/workerd@.service ]; then
+    $SUDO cp /usr/local/bin/workerd@.service /etc/systemd/system/
+    $SUDO systemctl daemon-reload
     echo "  workerd@.service installed"
-else
-    echo "  WARNING: service file not found — skipping"
 fi
 
-# ── 9. Setup nginx site ──
+# ── 10. Setup nginx site ──
 echo "→ Setting up nginx..."
-rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+$SUDO rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+# Make dirs writable by current user so post-receive hook can write configs
+$SUDO chown -R "$CURRENT_USER:$CURRENT_USER" /etc/nginx/sites-available
+$SUDO chown -R "$CURRENT_USER:$CURRENT_USER" /etc/nginx/sites-enabled
+$SUDO chown -R "$CURRENT_USER:$CURRENT_USER" /var/git
+$SUDO chown -R "$CURRENT_USER:$CURRENT_USER" /etc/workerd/workers
 
 if command -v workerd-gen-nginx &>/dev/null; then
-    workerd-gen-nginx
+    # Remove stale root-owned config so we can regenerate as current user
+    $SUDO rm -f /etc/nginx/sites-available/workerd
+    workerd-gen-nginx 2>/dev/null || true
+    $SUDO chown "$CURRENT_USER:$CURRENT_USER" /etc/nginx/sites-available/workerd
 fi
 
-if [ -f /etc/nginx/sites-available/workerd ]; then
-    ln -sf /etc/nginx/sites-available/workerd /etc/nginx/sites-enabled/workerd
-fi
+$SUDO ln -sf /etc/nginx/sites-available/workerd /etc/nginx/sites-enabled/workerd
+echo "  nginx sites configured"
 
-# ── 10. Create deploy user ──
-echo "→ Creating deploy user..."
-if ! id deploy &>/dev/null; then
-    useradd -m -s /bin/bash deploy
-fi
-mkdir -p /home/deploy/.ssh
-chmod 700 /home/deploy/.ssh
-touch /home/deploy/.ssh/authorized_keys
-chmod 600 /home/deploy/.ssh/authorized_keys
-chown -R deploy:deploy /home/deploy/.ssh
-echo "  Deploy user: deploy"
+# ── 11. Git safe directory ──
+echo "→ Configuring git..."
+git config --global --add safe.directory '*' 2>/dev/null || true
+git config --global init.defaultBranch main 2>/dev/null || true
+echo "  Git configured"
 
-# ── 11. Deploy sudoers ──
-echo "→ Setting up sudoers..."
-cat > /etc/sudoers.d/workerd-deploy << 'SUDOEOF'
-deploy ALL=(root) NOPASSWD: /bin/systemctl restart workerd@*
-deploy ALL=(root) NOPASSWD: /bin/systemctl start workerd@*
-deploy ALL=(root) NOPASSWD: /bin/systemctl stop workerd@*
-deploy ALL=(root) NOPASSWD: /bin/systemctl enable workerd@*
-deploy ALL=(root) NOPASSWD: /bin/systemctl disable workerd@*
-deploy ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
-deploy ALL=(root) NOPASSWD: /usr/sbin/nginx
-deploy ALL=(root) NOPASSWD: /usr/sbin/nginx -t
-deploy ALL=(root) NOPASSWD: /usr/sbin/nginx -s reload
-SUDOEOF
-chmod 440 /etc/sudoers.d/workerd-deploy
-echo "  /etc/sudoers.d/workerd-deploy"
-
-# ── 12. Stop caddy ──
-echo "→ Stopping Caddy..."
-systemctl stop caddy 2>/dev/null || true
-systemctl disable caddy 2>/dev/null || true
-
-# ── 13. Start nginx ──
+# ── 12. Start nginx ──
 echo "→ Starting nginx..."
-nginx -t && systemctl enable nginx && systemctl restart nginx
-echo "  nginx: $(systemctl is-active nginx)"
+if $SUDO nginx -t; then
+    $SUDO systemctl enable nginx
+    $SUDO systemctl restart nginx
+    echo "  nginx: active"
+else
+    echo "  ERROR: nginx config invalid"
+fi
 
-# ── 14. Enable TCP BBR ──
+# ── 13. Enable TCP BBR ──
 echo "→ Enabling TCP BBR..."
 if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
     echo "  BBR already enabled"
 else
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
-    echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
-    sysctl -p /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
+    echo "net.ipv4.tcp_congestion_control = bbr" | $SUDO tee -a /etc/sysctl.d/99-bbr.conf > /dev/null || true
+    echo "net.ipv4.tcp_fastopen = 3" | $SUDO tee -a /etc/sysctl.d/99-bbr.conf > /dev/null || true
+    $SUDO sysctl -p /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
     echo "  BBR enabled"
 fi
 
@@ -219,7 +245,18 @@ echo "Bootstrap complete!"
 echo "========================================="
 echo ""
 echo "Next steps:"
-echo "  1. Deploy a worker: workerd-scale up <name> <port>"
-echo "  2. Check status:    systemctl status 'workerd@*'"
-echo "  3. View logs:       journalctl -u 'workerd@*' -f"
-echo "  4. Reload nginx:    systemctl reload nginx"
+echo ""
+echo "  1. Add your SSH key (so you can push without password):"
+echo "     ssh-copy-id -i ~/.ssh/id_ed25519.pub \$USER@YOUR_SERVER"
+echo "     # Or: cat ~/.ssh/id_ed25519.pub | ssh \$USER@YOUR_SERVER 'tee -a ~/.ssh/authorized_keys'"
+echo ""
+echo "  2. Create a worker git repo on the server:"
+echo "     ssh \$USER@YOUR_SERVER 'git init --bare /var/git/my-worker.git'"
+echo ""
+echo "  3. Clone, add remote, push:"
+echo "     git clone https://github.com/YOU/my-worker.git"
+echo "     cd my-worker"
+echo "     git remote add deploy ssh://\$USER@YOUR_SERVER:/var/git/my-worker.git"
+echo "     git push deploy main"
+echo ""
+echo "See README.md for full guide."

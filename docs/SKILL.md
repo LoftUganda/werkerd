@@ -4,7 +4,7 @@
 
 `werkerd` is a self-hosted Cloudflare Workers runtime. It lets you deploy any Cloudflare Workers project to your own server using `workerd` — the real Cloudflare Workers runtime, open-sourced by Cloudflare.
 
-**Server**: `root@18.171.244.124` (Ubuntu 24.04)
+**Server**: `YOUR_USER@YOUR_SERVER` (Ubuntu 22.04+)
 
 The goal is parity with Cloudflare Workers DX for self-hosted code. No Cloudflare account needed.
 
@@ -28,7 +28,7 @@ werkerd deploy --port 8080
 ## When to Use This Skill
 
 Load this skill when:
-- Deploying a worker to `root@18.171.244.124`
+- Deploying a worker to `YOUR_USER@YOUR_SERVER`
 - Setting up service bindings, Durable Objects, KV, or WebSockets
 - Scaling a worker up/down across ports
 - Troubleshooting systemd, nginx, or workerd issues
@@ -220,7 +220,7 @@ Git-driven scaling CLI.
 
 ```bash
 # Show CPU cores and scaling advice
-ssh root@18.171.244.124 workerd-scale info
+ssh YOUR_USER@YOUR_SERVER workerd-scale info
 
 # Set instance count (git-driven workflow)
 # 1. Edit /etc/workerd/workers/<worker>/scale locally
@@ -302,7 +302,7 @@ All examples are standard npm projects. Deploy with `werkerd deploy`:
 cd examples/hello
 werkerd deploy --port 8080
 curl http://hello.localhost/
-curl http://18.171.244.124:8080/
+curl http://YOUR_SERVER:8080/
 ```
 
 ### Hono Framework

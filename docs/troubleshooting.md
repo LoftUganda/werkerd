@@ -132,7 +132,7 @@ nginx -t && systemctl reload nginx
 This is expected — `/nginx_status` is restricted to `127.0.0.1`. From outside the server:
 
 ```bash
-ssh root@18.171.244.124 'curl http://localhost/nginx_status'
+ssh YOUR_USER@YOUR_SERVER 'curl http://localhost/nginx_status'
 ```
 
 ### Symptom: nginx 502 only under load
@@ -208,10 +208,10 @@ werkerd deploy --port 8080
 
 ```bash
 # Check SSH connectivity
-ssh root@18.171.244.124 'echo connected'
+ssh YOUR_USER@YOUR_SERVER 'echo connected'
 
 # Check disk space
-ssh root@18.171.244.124 'df -h'
+ssh YOUR_USER@YOUR_SERVER 'df -h'
 ```
 
 ### Health check fails after deploy
@@ -238,13 +238,13 @@ git push deploy main
 # → Permission denied (publickey)
 ```
 
-**Fix**: Add your SSH key to the deploy user:
+**Fix**: Add your SSH key to the SSH user:
 
 ```bash
-ssh root@18.171.244.124
-mkdir -p /home/deploy/.ssh
-cat ~/.ssh/authorized_keys >> /home/deploy/.ssh/authorized_keys
-chown -R deploy:deploy /home/deploy/.ssh
+ssh-copy-id -i ~/.ssh/id_ed25519.pub YOUR_USER@YOUR_SERVER
+
+# Or manually:
+cat ~/.ssh/id_ed25519.pub | ssh YOUR_USER@YOUR_SERVER 'tee -a ~/.ssh/authorized_keys'
 ```
 
 ### Remote rejected (not a git directory)
@@ -257,7 +257,7 @@ git push deploy main
 **Fix**: Create the bare repo on the server:
 
 ```bash
-ssh root@18.171.244.124
+ssh YOUR_USER@YOUR_SERVER
 sudo mkdir -p /var/git/hello.git
 cd /var/git/hello.git
 sudo git init --bare
@@ -269,13 +269,13 @@ sudo chmod +x hooks/post-receive
 
 ```bash
 # Check hook is executable
-ssh root@18.171.244.124 'ls -la /var/git/hello.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'ls -la /var/git/hello.git/hooks/post-receive'
 
 # Check hook content
-ssh root@18.171.244.124 'cat /var/git/hello.git/hooks/post-receive'
+ssh YOUR_USER@YOUR_SERVER 'cat /var/git/hello.git/hooks/post-receive'
 
 # Run hook manually to test
-ssh root@18.171.244.124 'cd /var/git/hello.git && git --git-dir=. log -1 --oneline'
+ssh YOUR_USER@YOUR_SERVER 'cd /var/git/hello.git && git --git-dir=. log -1 --oneline'
 ```
 
 ---
@@ -286,14 +286,14 @@ ssh root@18.171.244.124 'cd /var/git/hello.git && git --git-dir=. log -1 --oneli
 
 ```bash
 # 1. Check .env exists on server
-ssh root@18.171.244.124 'cat /etc/workerd/workers/hello/.env'
+ssh YOUR_USER@YOUR_SERVER 'cat /etc/workerd/workers/hello/.env'
 
 # 2. Check .env is readable by workerd
-ssh root@18.171.244.124 'ls -la /etc/workerd/workers/hello/.env'
-ssh root@18.171.244.124 'chown workerd:workerd /etc/workerd/workers/hello/.env'
+ssh YOUR_USER@YOUR_SERVER 'ls -la /etc/workerd/workers/hello/.env'
+ssh YOUR_USER@YOUR_SERVER 'chown workerd:workerd /etc/workerd/workers/hello/.env'
 
 # 3. Check config has the binding
-ssh root@18.171.244.124 'grep -i secret /etc/workerd/workers/hello/config.8080.capnp'
+ssh YOUR_USER@YOUR_SERVER 'grep -i secret /etc/workerd/workers/hello/config.8080.capnp'
 ```
 
 ### Symptom: .env value not updating after change
@@ -317,7 +317,7 @@ workerd-scale set hello 2
 grep -A5 services examples/api/wrangler.jsonc
 
 # 2. Check config has both workers
-ssh root@18.171.244.124 'cat /etc/workerd/workers/api/config.8090.capnp'
+ssh YOUR_USER@YOUR_SERVER 'cat /etc/workerd/workers/api/config.8090.capnp'
 ```
 
 **Important**: Service bindings only work when both workers are in the **same Cap'n Proto config** (same process). For CLI-deployed workers, service bindings require manual config generation.
@@ -340,7 +340,7 @@ grep -A3 durable_objects examples/fullstack/wrangler.jsonc
 grep "class Counter" examples/fullstack/src/index.js
 
 # 3. Check config has the binding
-ssh root@18.171.244.124 'grep -i counter /etc/workerd/workers/fullstack/config.8085.capnp'
+ssh YOUR_USER@YOUR_SERVER 'grep -i counter /etc/workerd/workers/fullstack/config.8085.capnp'
 ```
 
 **Important**: DO classes must be exported from the **same module** that exports `default`.

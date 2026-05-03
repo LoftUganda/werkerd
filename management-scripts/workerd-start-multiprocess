@@ -1,0 +1,69 @@
+#!/bin/bash
+# /usr/local/bin/workerd-start-multiprocess
+# Starts N workerd processes on the same port using SO_REUSEPORT for kernel-level LB.
+# Reads instances from /etc/workerd/workers/<worker>/scale
+# Usage: workerd-start-multiprocess <worker> <port>
+
+set -euo pipefail
+
+WORKER="$1"
+PORT="$2"
+BASE_DIR="/etc/workerd/workers/${WORKER}"
+SCALE_FILE="${BASE_DIR}/scale"
+CONFIG="${BASE_DIR}/config.${PORT}.capnp"
+ENV_FILE="${BASE_DIR}/.env"
+
+# Load instances from scale file (default 1)
+if [ -f "$SCALE_FILE" ]; then
+    INSTANCES=$(cat "$SCALE_FILE" | tr -d ' ')
+else
+    INSTANCES=1
+fi
+
+# Allow override via env for testing
+INSTANCES=${WERKERD_INSTANCES:-$INSTANCES}
+
+# Load .env if present
+[ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
+
+PIDS_DIR="/run/workerd-${WORKER}-${PORT}"
+mkdir -p "$PIDS_DIR"
+
+start_instance() {
+    local id=$1
+    local pid_file="${PIDS_DIR}/${id}.pid"
+
+    /usr/bin/workerd serve "$CONFIG" --socket-fd http=3 &
+    echo $! > "$pid_file"
+}
+
+# Kill existing processes for this worker/port
+kill_instances() {
+    if [ -d "$PIDS_DIR" ]; then
+        for pidfile in "$PIDS_DIR"/*.pid; do
+            [ -f "$pidfile" ] || continue
+            pid=$(cat "$pidfile")
+            kill "$pid" 2>/dev/null || true
+        done
+        rm -rf "$PIDS_DIR"
+        mkdir -p "$PIDS_DIR"
+    fi
+}
+
+kill_instances
+
+echo "→ Starting ${INSTANCES} workerd instance(s) for ${WORKER}:${PORT}..."
+
+# Wait a moment for port to be free
+sleep 0.1
+
+# Start instances with slight stagger to avoid thundering herd
+for i in $(seq 1 "$INSTANCES"); do
+    start_instance $i
+    [ "$INSTANCES" -gt 1 ] && sleep 0.05
+done
+
+echo "✓ ${INSTANCES} workerd processes started for ${WORKER}:${PORT}"
+
+# Write current instances to a status file
+echo "$INSTANCES" > "${BASE_DIR}/.running_instances" 2>/dev/null || true
